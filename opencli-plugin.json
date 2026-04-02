@@ -1,0 +1,6 @@
+{
+  "name": "fishaudio",
+  "version": "1.0.0",
+  "opencli": ">=1.5.10",
+  "description": "Fish Audio 文字转语音：浏览声音、我的模型、TTS 生成（复用 Chrome 登录，无需 API Key）"
+}
