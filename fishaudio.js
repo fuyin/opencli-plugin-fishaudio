@@ -1,7 +1,11 @@
-import { cli, Strategy, CliError } from "@jackwener/opencli/registry";
+import { cli, Strategy } from "@jackwener/opencli/registry";
 import { writeFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
 const BASE_URL = "https://api.fish.audio";
+function fail(message, hint) {
+  throw new Error(hint ? `${message}
+\u2192 ${hint}` : message);
+}
 async function getToken(page) {
   await page.goto("https://fish.audio");
   await page.wait(2);
@@ -56,8 +60,7 @@ async function getToken(page) {
   if (!result?.token) {
     const lsInfo = result?.keys?.length ? `localStorage keys: [${result.keys.join(", ")}]` : "localStorage is empty";
     const ckInfo = result?.cookieKeys?.length ? `cookies: [${result.cookieKeys.join(", ")}]` : "no cookies";
-    throw new CliError(
-      "AUTH_REQUIRED",
+    fail(
       "Fish Audio \u672A\u767B\u5F55\uFF08\u672A\u627E\u5230 token\uFF09",
       `\u8BF7\u5728 Chrome \u4E2D\u6253\u5F00 https://fish.audio \u5B8C\u6210\u767B\u5F55\u540E\u91CD\u8BD5\u3002
 \u8BCA\u65AD\u4FE1\u606F\uFF1A${lsInfo}\uFF1B${ckInfo}`
@@ -71,8 +74,7 @@ async function apiGet(token, path) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new CliError(
-      "API_ERROR",
+    fail(
       err?.message || `Fish Audio API \u9519\u8BEF ${res.status}`,
       res.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : void 0
     );
@@ -102,7 +104,7 @@ cli({
   ],
   columns: ["id", "title", "author", "languages", "likes", "tasks"],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError("BROWSER_CONNECT", "\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
     const token = await getToken(page);
     const params = new URLSearchParams({
       page_size: String(Math.min(kwargs.limit ?? 20, 50)),
@@ -114,7 +116,7 @@ cli({
     if (kwargs.tag) params.set("tag", kwargs.tag);
     const data = await apiGet(token, `/model?${params}`);
     if (!data?.items?.length) {
-      throw new CliError("EMPTY_RESULT", "\u672A\u627E\u5230\u58F0\u97F3\u6A21\u578B", "\u6362\u4E00\u4E0B\u8FC7\u6EE4\u6761\u4EF6\uFF0C\u6216\u8BBF\u95EE fish.audio/discover \u6D4F\u89C8\u66F4\u591A");
+      fail("\u672A\u627E\u5230\u58F0\u97F3\u6A21\u578B", "\u6362\u4E00\u4E0B\u8FC7\u6EE4\u6761\u4EF6\uFF0C\u6216\u8BBF\u95EE fish.audio/discover \u6D4F\u89C8\u66F4\u591A");
     }
     return data.items.map((m) => ({
       id: m._id,
@@ -137,7 +139,7 @@ cli({
   args: [{ name: "limit", type: "int", default: 20, help: "\u8FD4\u56DE\u6570\u91CF\uFF08\u9ED8\u8BA4 20\uFF09" }],
   columns: ["id", "title", "languages", "state", "tasks"],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError("BROWSER_CONNECT", "\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
     const token = await getToken(page);
     const params = new URLSearchParams({
       page_size: String(Math.min(kwargs.limit ?? 20, 50)),
@@ -146,8 +148,7 @@ cli({
     });
     const data = await apiGet(token, `/model?${params}`);
     if (!data?.items?.length) {
-      throw new CliError(
-        "EMPTY_RESULT",
+      fail(
         "\u4F60\u8FD8\u6CA1\u6709\u58F0\u97F3\u6A21\u578B",
         "\u524D\u5F80 https://fish.audio/voice-cloning/ \u514B\u9686\u4E00\u4E2A\u58F0\u97F3"
       );
@@ -185,7 +186,7 @@ cli({
   ],
   columns: ["file", "size_kb", "model", "voice", "encoding"],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError("BROWSER_CONNECT", "\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
     const token = await getToken(page);
     const speed = Math.min(2, Math.max(0.5, kwargs.speed ?? 1));
     const encoding = kwargs.encoding || "mp3";
@@ -209,7 +210,7 @@ cli({
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       const hint = res.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio" : res.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : void 0;
-      throw new CliError("API_ERROR", err?.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${res.status})`, hint);
+      fail(err?.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${res.status})`, hint);
     }
     const outputPath = kwargs.output || "output.mp3";
     const buffer = await res.arrayBuffer();
@@ -240,7 +241,7 @@ cli({
   ],
   columns: ["date", "voice_id", "voice", "backend", "text_preview"],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError("BROWSER_CONNECT", "\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
     const token = await getToken(page);
     const pageSize = Math.min(kwargs.limit ?? 20, 50);
     const params = new URLSearchParams({
@@ -250,8 +251,7 @@ cli({
     });
     const data = await apiGet(token, `/task?${params}`);
     if (!data?.items?.length) {
-      throw new CliError(
-        "EMPTY_RESULT",
+      fail(
         "\u6682\u65E0 TTS \u751F\u6210\u8BB0\u5F55",
         "\u524D\u5F80 https://fish.audio/zh-CN/app/text-to-speech/ \u751F\u6210\u4E00\u6BB5\u8BED\u97F3\u540E\u518D\u67E5\u8BE2"
       );
@@ -296,7 +296,7 @@ cli({
   ],
   columns: ["id", "title", "author", "languages", "likes", "tasks"],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError("BROWSER_CONNECT", "\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
     const token = await getToken(page);
     const scanSize = Math.min(kwargs.limit ?? 20, 100);
     const params = new URLSearchParams({
@@ -308,12 +308,11 @@ cli({
     if (kwargs.language) params.set("language", kwargs.language);
     const data = await apiGet(token, `/model?${params}`);
     if (!data?.items) {
-      throw new CliError("API_ERROR", "\u83B7\u53D6\u6A21\u578B\u5217\u8868\u5931\u8D25");
+      fail("\u83B7\u53D6\u6A21\u578B\u5217\u8868\u5931\u8D25");
     }
     const favorites = data.items.filter((m) => m.marked === true);
     if (!favorites.length) {
-      throw new CliError(
-        "EMPTY_RESULT",
+      fail(
         `\u5728\u524D ${scanSize} \u6761\u7ED3\u679C\u4E2D\u672A\u627E\u5230\u5DF2\u6536\u85CF\u6A21\u578B`,
         "\u6536\u85CF\u7684\u58F0\u97F3\u53EF\u80FD\u6392\u5E8F\u9760\u540E\uFF1B\u8BF7\u7528 --query \u5173\u952E\u8BCD\u7F29\u5C0F\u8303\u56F4\uFF0C\u6216\u524D\u5F80 https://fish.audio/discover/ \u67E5\u770B"
       );
@@ -339,7 +338,7 @@ cli({
   args: [],
   columns: ["status", "token_key", "token_prefix", "ls_keys", "cookie_keys"],
   func: async (page) => {
-    if (!page) throw new CliError("BROWSER_CONNECT", "\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
     await page.goto("https://fish.audio");
     await page.wait(2);
     const result = await page.evaluate(`(async () => {

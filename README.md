@@ -4,15 +4,16 @@
 
 ## 安装
 
-需要已安装 OpenCLI（>= 1.5.9，且包含将 `CliError` 导出到 `@jackwener/opencli/registry` 的版本）。
+需要已安装 OpenCLI（>= 1.5.9）。插件不依赖 `@jackwener/opencli/registry` 中的 `CliError` 导出，可与 1.6.x 等版本正常使用。
 
 ```bash
 opencli plugin install github:fuyin/opencli-plugin-fishaudio
 ```
 
-开发时可本地链接：
+开发时可本地链接（修改 `fishaudio.ts` 后执行 `npm install && npm run build` 更新 `fishaudio.js`，或确保全局已有 `esbuild` 以便安装时自动转译）：
 
 ```bash
+cd opencli-plugin-fishaudio && npm install && npm run build
 opencli plugin install file:///绝对路径/opencli-plugin-fishaudio
 ```
 

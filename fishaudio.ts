@@ -6,11 +6,20 @@
  * @see https://github.com/jackwener/opencli-plugin-fishaudio
  */
 
-import { cli, Strategy, CliError, type IPage } from '@jackwener/opencli/registry';
+import { cli, Strategy, type IPage } from '@jackwener/opencli/registry';
 import { writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 
 const BASE_URL = 'https://api.fish.audio';
+
+/**
+ * 报告错误并抛出（不依赖 registry 中的 CliError，兼容 @jackwener/opencli 1.5.x–1.6.x
+ * 等未从 `@jackwener/opencli/registry` 导出 CliError 的版本；避免插件在加载阶段因
+ * 缺失导出而整块注册失败）。
+ */
+function fail(message: string, hint?: string): never {
+  throw new Error(hint ? `${message}\n→ ${hint}` : message);
+}
 
 async function getToken(page: IPage): Promise<string> {
   await page.goto('https://fish.audio');
@@ -68,8 +77,7 @@ async function getToken(page: IPage): Promise<string> {
   if (!result?.token) {
     const lsInfo  = result?.keys?.length  ? `localStorage keys: [${result.keys.join(', ')}]`   : 'localStorage is empty';
     const ckInfo  = result?.cookieKeys?.length ? `cookies: [${result.cookieKeys.join(', ')}]` : 'no cookies';
-    throw new CliError(
-      'AUTH_REQUIRED',
+    fail(
       'Fish Audio 未登录（未找到 token）',
       `请在 Chrome 中打开 https://fish.audio 完成登录后重试。\n诊断信息：${lsInfo}；${ckInfo}`,
     );
@@ -84,8 +92,7 @@ async function apiGet(token: string, path: string): Promise<unknown> {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({})) as Record<string, unknown>;
-    throw new CliError(
-      'API_ERROR',
+    fail(
       (err?.message as string) || `Fish Audio API 错误 ${res.status}`,
       res.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' : undefined,
     );
@@ -116,7 +123,7 @@ cli({
   ],
   columns: ['id', 'title', 'author', 'languages', 'likes', 'tasks'],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    if (!page) fail('需要浏览器连接');
     const token = await getToken(page);
 
     const params = new URLSearchParams({
@@ -130,7 +137,7 @@ cli({
 
     const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
     if (!data?.items?.length) {
-      throw new CliError('EMPTY_RESULT', '未找到声音模型', '换一下过滤条件，或访问 fish.audio/discover 浏览更多');
+      fail('未找到声音模型', '换一下过滤条件，或访问 fish.audio/discover 浏览更多');
     }
 
     return (data.items as Record<string, unknown>[]).map(m => ({
@@ -155,7 +162,7 @@ cli({
   args: [{ name: 'limit', type: 'int', default: 20, help: '返回数量（默认 20）' }],
   columns: ['id', 'title', 'languages', 'state', 'tasks'],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    if (!page) fail('需要浏览器连接');
     const token = await getToken(page);
 
     const params = new URLSearchParams({
@@ -166,8 +173,7 @@ cli({
 
     const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
     if (!data?.items?.length) {
-      throw new CliError(
-        'EMPTY_RESULT',
+      fail(
         '你还没有声音模型',
         '前往 https://fish.audio/voice-cloning/ 克隆一个声音',
       );
@@ -207,7 +213,7 @@ cli({
   ],
   columns: ['file', 'size_kb', 'model', 'voice', 'encoding'],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    if (!page) fail('需要浏览器连接');
     const token = await getToken(page);
 
     const speed    = Math.min(2.0, Math.max(0.5, (kwargs.speed as number) ?? 1.0));
@@ -237,7 +243,7 @@ cli({
         res.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
         res.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
         undefined;
-      throw new CliError('API_ERROR', (err?.message as string) || `TTS 请求失败 (${res.status})`, hint);
+      fail((err?.message as string) || `TTS 请求失败 (${res.status})`, hint);
     }
 
     const outputPath: string = (kwargs.output as string) || 'output.mp3';
@@ -273,7 +279,7 @@ cli({
   ],
   columns: ['date', 'voice_id', 'voice', 'backend', 'text_preview'],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    if (!page) fail('需要浏览器连接');
     const token = await getToken(page);
 
     const pageSize = Math.min((kwargs.limit as number) ?? 20, 50);
@@ -285,8 +291,7 @@ cli({
 
     const data = await apiGet(token, `/task?${params}`) as { total: number; items: unknown[] };
     if (!data?.items?.length) {
-      throw new CliError(
-        'EMPTY_RESULT',
+      fail(
         '暂无 TTS 生成记录',
         '前往 https://fish.audio/zh-CN/app/text-to-speech/ 生成一段语音后再查询',
       );
@@ -345,7 +350,7 @@ cli({
   ],
   columns: ['id', 'title', 'author', 'languages', 'likes', 'tasks'],
   func: async (page, kwargs) => {
-    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    if (!page) fail('需要浏览器连接');
     const token = await getToken(page);
 
     // fish.audio 公开 API 无专用"收藏列表"端点；
@@ -361,14 +366,13 @@ cli({
 
     const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
     if (!data?.items) {
-      throw new CliError('API_ERROR', '获取模型列表失败');
+      fail('获取模型列表失败');
     }
 
     const favorites = (data.items as Record<string, unknown>[]).filter(m => m.marked === true);
 
     if (!favorites.length) {
-      throw new CliError(
-        'EMPTY_RESULT',
+      fail(
         `在前 ${scanSize} 条结果中未找到已收藏模型`,
         '收藏的声音可能排序靠后；请用 --query 关键词缩小范围，或前往 https://fish.audio/discover/ 查看',
       );
@@ -396,7 +400,7 @@ cli({
   args: [],
   columns: ['status', 'token_key', 'token_prefix', 'ls_keys', 'cookie_keys'],
   func: async (page) => {
-    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    if (!page) fail('需要浏览器连接');
     await page.goto('https://fish.audio');
     await page.wait(2);
 

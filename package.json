@@ -4,7 +4,13 @@
   "type": "module",
   "description": "OpenCLI plugin: Fish Audio TTS (voices, my-voices, my-recent, my-favorites, tts, auth-check) using browser login",
   "license": "Apache-2.0",
+  "scripts": {
+    "build": "esbuild fishaudio.ts --outfile=fishaudio.js --format=esm --platform=node"
+  },
   "peerDependencies": {
     "@jackwener/opencli": ">=1.5.10"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   }
 }
