@@ -68,18 +68,31 @@ async function getToken(page) {
   }
   return result.token;
 }
-async function apiGet(token, path) {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
+async function apiGet(page, token, path) {
+  const url = BASE_URL + path;
+  const result = await page.evaluate(`(async () => {
+    try {
+      const res = await fetch(${JSON.stringify(url)}, {
+        headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} }
+      });
+      const body = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, body };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e) };
+    }
+  })()`);
+  const r = result;
+  if (!r.ok) {
+    if (r.error) {
+      fail(`\u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25: ${r.error}`, "\u8BF7\u68C0\u67E5\u7F51\u7EDC\u8FDE\u63A5\u6216\u4EE3\u7406\u8BBE\u7F6E");
+    }
+    const msg = r.body?.message;
     fail(
-      err?.message || `Fish Audio API \u9519\u8BEF ${res.status}`,
-      res.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : void 0
+      msg || `Fish Audio API \u9519\u8BEF ${r.status}`,
+      r.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : void 0
     );
   }
-  return res.json();
+  return r.body;
 }
 cli({
   site: "fishaudio",
@@ -114,7 +127,7 @@ cli({
     if (kwargs.query) params.set("title", kwargs.query);
     if (kwargs.language) params.set("language", kwargs.language);
     if (kwargs.tag) params.set("tag", kwargs.tag);
-    const data = await apiGet(token, `/model?${params}`);
+    const data = await apiGet(page, token, `/model?${params}`);
     if (!data?.items?.length) {
       fail("\u672A\u627E\u5230\u58F0\u97F3\u6A21\u578B", "\u6362\u4E00\u4E0B\u8FC7\u6EE4\u6761\u4EF6\uFF0C\u6216\u8BBF\u95EE fish.audio/discover \u6D4F\u89C8\u66F4\u591A");
     }
@@ -146,7 +159,7 @@ cli({
       page_number: "1",
       self: "true"
     });
-    const data = await apiGet(token, `/model?${params}`);
+    const data = await apiGet(page, token, `/model?${params}`);
     if (!data?.items?.length) {
       fail(
         "\u4F60\u8FD8\u6CA1\u6709\u58F0\u97F3\u6A21\u578B",
@@ -190,38 +203,57 @@ cli({
     const token = await getToken(page);
     const speed = Math.min(2, Math.max(0.5, kwargs.speed ?? 1));
     const encoding = kwargs.encoding || "mp3";
-    const body = {
+    const ttsModel = kwargs.model || "s1";
+    const bodyObj = {
       text: kwargs.text,
       format: encoding,
       normalize: true,
       latency: "normal",
       prosody: { speed }
     };
-    if (kwargs.voice) body.reference_id = kwargs.voice;
-    const res = await fetch(`${BASE_URL}/v1/tts`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        model: kwargs.model || "s1"
-      },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      const hint = res.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio" : res.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : void 0;
-      fail(err?.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${res.status})`, hint);
+    if (kwargs.voice) bodyObj.reference_id = kwargs.voice;
+    const ttsResult = await page.evaluate(`(async () => {
+      try {
+        const res = await fetch('${BASE_URL}/v1/tts', {
+          method: 'POST',
+          headers: {
+            Authorization:  'Bearer ' + ${JSON.stringify(token)},
+            'Content-Type': 'application/json',
+            model:          ${JSON.stringify(ttsModel)},
+          },
+          body: JSON.stringify(${JSON.stringify(bodyObj)}),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          const hint =
+            res.status === 401 ? '\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio' :
+            res.status === 402 ? '\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C' :
+            undefined;
+          return { ok: false, status: res.status, message: err?.message, hint };
+        }
+        // \u8BFB\u53D6\u4E8C\u8FDB\u5236\u5E76\u8F6C base64 \u4EE5\u4FBF\u4F20\u56DE Node.js
+        const buf = await res.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return { ok: true, base64: btoa(bin), size: bytes.length };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e), hint: '\u8BF7\u68C0\u67E5\u7F51\u7EDC\u8FDE\u63A5\u6216\u4EE3\u7406\u8BBE\u7F6E' };
+      }
+    })()`);
+    const r = ttsResult;
+    if (!r.ok) {
+      fail(r.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${r.status})`, r.hint);
     }
     const outputPath = kwargs.output || "output.mp3";
-    const buffer = await res.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
+    const bytes = Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0));
     const dir = dirname(outputPath);
     if (dir && dir !== ".") mkdirSync(dir, { recursive: true });
     writeFileSync(outputPath, bytes);
     return [{
       file: outputPath,
       size_kb: (bytes.byteLength / 1024).toFixed(1),
-      model: kwargs.model || "s1",
+      model: ttsModel,
       voice: kwargs.voice || "(\u9ED8\u8BA4)",
       encoding
     }];
@@ -249,7 +281,7 @@ cli({
       page_size: String(pageSize),
       page_number: "1"
     });
-    const data = await apiGet(token, `/task?${params}`);
+    const data = await apiGet(page, token, `/task?${params}`);
     if (!data?.items?.length) {
       fail(
         "\u6682\u65E0 TTS \u751F\u6210\u8BB0\u5F55",
@@ -258,7 +290,7 @@ cli({
     }
     const items = data.items;
     const seen = /* @__PURE__ */ new Set();
-    const rows = items.filter((t) => {
+    return items.filter((t) => {
       if (!kwargs.unique) return true;
       const key = t.model?._id ?? "";
       if (!key || seen.has(key)) return false;
@@ -271,7 +303,6 @@ cli({
       backend: t.backend ?? "\u2014",
       text_preview: (t.parameters?.text ?? "").slice(0, 40).replace(/\n/g, " ") + "\u2026"
     }));
-    return rows;
   }
 });
 cli({
@@ -306,7 +337,7 @@ cli({
     });
     if (kwargs.query) params.set("title", kwargs.query);
     if (kwargs.language) params.set("language", kwargs.language);
-    const data = await apiGet(token, `/model?${params}`);
+    const data = await apiGet(page, token, `/model?${params}`);
     if (!data?.items) {
       fail("\u83B7\u53D6\u6A21\u578B\u5217\u8868\u5931\u8D25");
     }

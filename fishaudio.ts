@@ -2,6 +2,9 @@
  * Fish Audio — OpenCLI plugin
  *
  * 无需 API Key：复用 Chrome 中已登录的 https://fish.audio 会话。
+ * 所有 API 请求均通过 page.evaluate 在浏览器内执行，完全复用 Chrome 网络栈
+ * （代理、SSL 证书链、Cookie），避免 Node.js 原生 fetch 在 macOS / 企业网络下
+ * 因代理或证书链差异导致 "fetch failed"。
  *
  * @see https://github.com/jackwener/opencli-plugin-fishaudio
  */
@@ -13,14 +16,14 @@ import { dirname } from 'path';
 const BASE_URL = 'https://api.fish.audio';
 
 /**
- * 报告错误并抛出（不依赖 registry 中的 CliError，兼容 @jackwener/opencli 1.5.x–1.6.x
- * 等未从 `@jackwener/opencli/registry` 导出 CliError 的版本；避免插件在加载阶段因
- * 缺失导出而整块注册失败）。
+ * 统一报错：不依赖 @jackwener/opencli/registry 中的 CliError，
+ * 兼容该导出在某些版本中缺失的情况。
  */
 function fail(message: string, hint?: string): never {
   throw new Error(hint ? `${message}\n→ ${hint}` : message);
 }
 
+/** 从 localStorage / cookie 中提取 fish.audio token（在浏览器上下文内运行）。 */
 async function getToken(page: IPage): Promise<string> {
   await page.goto('https://fish.audio');
   await page.wait(2);
@@ -75,8 +78,8 @@ async function getToken(page: IPage): Promise<string> {
   })()`) as { token: string | null; tokenKey?: string; keys: string[]; cookieKeys: string[] };
 
   if (!result?.token) {
-    const lsInfo  = result?.keys?.length  ? `localStorage keys: [${result.keys.join(', ')}]`   : 'localStorage is empty';
-    const ckInfo  = result?.cookieKeys?.length ? `cookies: [${result.cookieKeys.join(', ')}]` : 'no cookies';
+    const lsInfo = result?.keys?.length  ? `localStorage keys: [${result.keys.join(', ')}]` : 'localStorage is empty';
+    const ckInfo = result?.cookieKeys?.length ? `cookies: [${result.cookieKeys.join(', ')}]` : 'no cookies';
     fail(
       'Fish Audio 未登录（未找到 token）',
       `请在 Chrome 中打开 https://fish.audio 完成登录后重试。\n诊断信息：${lsInfo}；${ckInfo}`,
@@ -86,18 +89,38 @@ async function getToken(page: IPage): Promise<string> {
   return result.token;
 }
 
-async function apiGet(token: string, path: string): Promise<unknown> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as Record<string, unknown>;
+/**
+ * 通过浏览器执行 GET 请求，完全复用 Chrome 网络栈。
+ * 返回已解析的 JSON；失败时 fail()。
+ */
+async function apiGet(page: IPage, token: string, path: string): Promise<unknown> {
+  const url = BASE_URL + path;
+  const result = await page.evaluate(`(async () => {
+    try {
+      const res = await fetch(${JSON.stringify(url)}, {
+        headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} }
+      });
+      const body = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, body };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e) };
+    }
+  })()`);
+
+  const r = result as { ok: boolean; status: number; body?: unknown; error?: string };
+
+  if (!r.ok) {
+    if (r.error) {
+      fail(`网络请求失败: ${r.error}`, '请检查网络连接或代理设置');
+    }
+    const msg = (r.body as Record<string, unknown>)?.message as string | undefined;
     fail(
-      (err?.message as string) || `Fish Audio API 错误 ${res.status}`,
-      res.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' : undefined,
+      msg || `Fish Audio API 错误 ${r.status}`,
+      r.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' : undefined,
     );
   }
-  return res.json();
+
+  return r.body;
 }
 
 cli({
@@ -135,7 +158,7 @@ cli({
     if (kwargs.language) params.set('language', kwargs.language);
     if (kwargs.tag)      params.set('tag', kwargs.tag);
 
-    const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
+    const data = await apiGet(page, token, `/model?${params}`) as { total: number; items: unknown[] };
     if (!data?.items?.length) {
       fail('未找到声音模型', '换一下过滤条件，或访问 fish.audio/discover 浏览更多');
     }
@@ -171,7 +194,7 @@ cli({
       self:        'true',
     });
 
-    const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
+    const data = await apiGet(page, token, `/model?${params}`) as { total: number; items: unknown[] };
     if (!data?.items?.length) {
       fail(
         '你还没有声音模型',
@@ -218,47 +241,65 @@ cli({
 
     const speed    = Math.min(2.0, Math.max(0.5, (kwargs.speed as number) ?? 1.0));
     const encoding = (kwargs.encoding as string) || 'mp3';
-    const body: Record<string, unknown> = {
+    const ttsModel = (kwargs.model as string) || 's1';
+
+    const bodyObj: Record<string, unknown> = {
       text:      kwargs.text,
       format:    encoding,
       normalize: true,
       latency:   'normal',
       prosody:   { speed },
     };
-    if (kwargs.voice) body.reference_id = kwargs.voice;
+    if (kwargs.voice) bodyObj.reference_id = kwargs.voice;
 
-    const res = await fetch(`${BASE_URL}/v1/tts`, {
-      method: 'POST',
-      headers: {
-        Authorization:   `Bearer ${token}`,
-        'Content-Type':  'application/json',
-        model:           (kwargs.model as string) || 's1',
-      },
-      body: JSON.stringify(body),
-    });
+    // TTS 返回二进制音频，在浏览器内读取并转为 base64 后传回 Node.js
+    const ttsResult = await page.evaluate(`(async () => {
+      try {
+        const res = await fetch('${BASE_URL}/v1/tts', {
+          method: 'POST',
+          headers: {
+            Authorization:  'Bearer ' + ${JSON.stringify(token)},
+            'Content-Type': 'application/json',
+            model:          ${JSON.stringify(ttsModel)},
+          },
+          body: JSON.stringify(${JSON.stringify(bodyObj)}),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          const hint =
+            res.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
+            res.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
+            undefined;
+          return { ok: false, status: res.status, message: err?.message, hint };
+        }
+        // 读取二进制并转 base64 以便传回 Node.js
+        const buf = await res.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return { ok: true, base64: btoa(bin), size: bytes.length };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e), hint: '请检查网络连接或代理设置' };
+      }
+    })()`);
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({})) as Record<string, unknown>;
-      const hint =
-        res.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
-        res.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
-        undefined;
-      fail((err?.message as string) || `TTS 请求失败 (${res.status})`, hint);
+    const r = ttsResult as { ok: boolean; status?: number; base64?: string; size?: number; message?: string; hint?: string };
+
+    if (!r.ok) {
+      fail(r.message || `TTS 请求失败 (${r.status})`, r.hint);
     }
 
     const outputPath: string = (kwargs.output as string) || 'output.mp3';
-    const buffer = await res.arrayBuffer();
-    const bytes  = new Uint8Array(buffer);
+    const bytes = Uint8Array.from(atob(r.base64!), c => c.charCodeAt(0));
 
     const dir = dirname(outputPath);
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
-
     writeFileSync(outputPath, bytes);
 
     return [{
       file:     outputPath,
       size_kb:  (bytes.byteLength / 1024).toFixed(1),
-      model:    (kwargs.model as string) || 's1',
+      model:    ttsModel,
       voice:    (kwargs.voice as string) || '(默认)',
       encoding,
     }];
@@ -289,7 +330,7 @@ cli({
       page_number: '1',
     });
 
-    const data = await apiGet(token, `/task?${params}`) as { total: number; items: unknown[] };
+    const data = await apiGet(page, token, `/task?${params}`) as { total: number; items: unknown[] };
     if (!data?.items?.length) {
       fail(
         '暂无 TTS 生成记录',
@@ -308,7 +349,7 @@ cli({
     const items = data.items as TaskItem[];
     const seen = new Set<string>();
 
-    const rows = items
+    return items
       .filter(t => {
         if (!(kwargs.unique as boolean)) return true;
         const key = t.model?._id ?? '';
@@ -323,8 +364,6 @@ cli({
         backend:      t.backend ?? '—',
         text_preview: (t.parameters?.text ?? '').slice(0, 40).replace(/\n/g, ' ') + '…',
       }));
-
-    return rows;
   },
 });
 
@@ -354,7 +393,7 @@ cli({
     const token = await getToken(page);
 
     // fish.audio 公开 API 无专用"收藏列表"端点；
-    // 通过拉取最多 100 条公开模型，筛选当前用户已标记（marked=true）的条目。
+    // 拉取公开模型并筛选当前用户已标记（marked=true）的条目。
     const scanSize = Math.min((kwargs.limit as number) ?? 20, 100);
     const params = new URLSearchParams({
       page_size:   String(scanSize),
@@ -364,7 +403,7 @@ cli({
     if (kwargs.query)    params.set('title', kwargs.query);
     if (kwargs.language) params.set('language', kwargs.language);
 
-    const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
+    const data = await apiGet(page, token, `/model?${params}`) as { total: number; items: unknown[] };
     if (!data?.items) {
       fail('获取模型列表失败');
     }
