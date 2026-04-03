@@ -1,7 +1,6 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 import { writeFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
-import { request as httpsRequest } from "node:https";
 const BASE_URL = "https://api.fish.audio";
 function fail(message, hint) {
   throw new Error(hint ? `${message}
@@ -94,38 +93,6 @@ async function apiGet(page, token, path) {
     );
   }
   return r.body;
-}
-function nodeTtsPost(token, ttsModel, bodyObj) {
-  const bodyStr = JSON.stringify(bodyObj);
-  const bodyBuf = Buffer.from(bodyStr, "utf8");
-  return new Promise((resolve) => {
-    const req = httpsRequest(
-      {
-        hostname: "api.fish.audio",
-        path: "/v1/tts",
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "model": ttsModel,
-          "Content-Length": String(bodyBuf.length)
-        }
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => resolve({
-          ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
-          status: res.statusCode ?? 0,
-          data: Buffer.concat(chunks)
-        }));
-        res.on("error", (err) => resolve({ ok: false, status: 0, data: Buffer.alloc(0), errMsg: err.message }));
-      }
-    );
-    req.on("error", (err) => resolve({ ok: false, status: 0, data: Buffer.alloc(0), errMsg: err.message }));
-    req.write(bodyBuf);
-    req.end();
-  });
 }
 cli({
   site: "fishaudio",
@@ -245,24 +212,52 @@ cli({
       prosody: { speed }
     };
     if (kwargs.voice) bodyObj.reference_id = kwargs.voice;
-    const ttsResult = await nodeTtsPost(token, ttsModel, bodyObj);
-    if (!ttsResult.ok) {
-      if (ttsResult.errMsg) {
-        fail(
-          `TTS \u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25: ${ttsResult.errMsg}`,
-          "\u8BF7\u68C0\u67E5\u7F51\u7EDC\u8FDE\u63A5\uFF0C\u6216\u5C1D\u8BD5\u8BBE\u7F6E HTTPS_PROXY \u73AF\u5883\u53D8\u91CF"
-        );
-      }
-      let errMsg = `TTS \u8BF7\u6C42\u5931\u8D25 (${ttsResult.status})`;
+    await page.goto("https://api.fish.audio");
+    await page.wait(1);
+    const ttsResult = await page.evaluate(`(async () => {
       try {
-        errMsg = JSON.parse(ttsResult.data.toString("utf8"))?.message || errMsg;
-      } catch {
+        if (!location.origin.includes('api.fish.audio')) {
+          return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
+        }
+        const res = await fetch('/v1/tts', {
+          method: 'POST',
+          headers: {
+            Authorization:  'Bearer ' + ${JSON.stringify(token)},
+            'Content-Type': 'application/json',
+            model:          ${JSON.stringify(ttsModel)},
+          },
+          body: JSON.stringify(${JSON.stringify(bodyObj)}),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          return {
+            ok:   false,
+            status: res.status,
+            message: err?.message || ('HTTP ' + res.status),
+            hint: res.status === 401 ? '\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio' :
+                  res.status === 402 ? '\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C' :
+                  undefined,
+          };
+        }
+        const buf   = await res.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        // \u5206\u5757 btoa \u907F\u514D\u8D85\u5927\u97F3\u9891 String.fromCharCode \u6808\u6EA2\u51FA
+        const CHUNK = 65536;
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+        }
+        return { ok: true, base64: btoa(bin), size: bytes.length };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e) };
       }
-      const hint = ttsResult.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio" : ttsResult.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : void 0;
-      fail(errMsg, hint);
+    })()`);
+    const r = ttsResult;
+    if (!r.ok) {
+      fail(r.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${r.status})`, r.hint);
     }
     const outputPath = kwargs.output || "output.mp3";
-    const bytes = new Uint8Array(ttsResult.data);
+    const bytes = Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0));
     const dir = dirname(outputPath);
     if (dir && dir !== ".") mkdirSync(dir, { recursive: true });
     writeFileSync(outputPath, bytes);
