@@ -24,16 +24,31 @@ opencli plugin install file:///绝对路径/opencli-plugin-fishaudio
 |------|------|
 | `opencli fishaudio auth-check` | 诊断是否已从页面读到登录 token |
 | `opencli fishaudio voices` | 浏览公开声音（可 `--language zh`、`--limit` 等） |
-| `opencli fishaudio my-voices` | 我的声音模型 |
-| `opencli fishaudio tts <text>` | 生成语音；`--voice <id>`、`--model s1\|s2-pro`、`--encoding mp3\|wav\|opus`、`--output path` |
+| `opencli fishaudio my-voices` | 我的声音模型（自己创建/上传的） |
+| `opencli fishaudio my-recent` | 我最近使用过的声音（TTS 生成历史，按时间倒序） |
+| `opencli fishaudio my-favorites` | 我收藏的声音（在搜索结果中扫描已收藏项） |
+| `opencli fishaudio tts <text>` | 生成语音；`--voice <id>`、`--model s1\|s2-pro`（默认 s1）、`--encoding mp3\|wav\|opus`、`--output path` |
 
 注意：全局已有 `-f/--format` 表示**表格输出格式**，音频格式请用 **`--encoding`**。
+
+### my-favorites 说明
+
+fish.audio 公开 REST API 没有专用的"我的收藏列表"端点。`my-favorites` 通过扫描公开模型列表，筛选出当前用户已标记（收藏）的条目。建议配合 `--query <关键词>` 缩小范围以提高命中率：
+
+```bash
+opencli fishaudio my-favorites --query "Sarah" --limit 50
+```
 
 ## 示例
 
 ```bash
 opencli fishaudio auth-check
 opencli fishaudio voices --language zh --limit 10
+opencli fishaudio my-voices
+opencli fishaudio my-recent --limit 10
+opencli fishaudio my-recent --unique          # 去重，每个声音只显示一次
+opencli fishaudio my-favorites                # 扫描前 20 条公开声音里的收藏
+opencli fishaudio my-favorites --query "Sarah" --limit 50
 opencli fishaudio tts "你好，世界" --voice <声音ID> --output hello.mp3
 ```
 

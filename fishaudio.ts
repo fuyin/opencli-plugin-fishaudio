@@ -194,7 +194,7 @@ cli({
   args: [
     { name: 'text', type: 'str', required: true, positional: true, help: '要转换为语音的文字' },
     { name: 'voice', type: 'str', default: '', help: '声音模型 ID（用 opencli fishaudio voices 查询）' },
-    { name: 'model', type: 'str', default: 's2-pro', choices: ['s1', 's2-pro'], help: 'TTS 模型: s1 | s2-pro（默认: s2-pro）' },
+    { name: 'model', type: 'str', default: 's1', choices: ['s1', 's2-pro'], help: 'TTS 模型: s1 | s2-pro（默认: s1）' },
     { name: 'output', type: 'str', default: 'output.mp3', help: '输出文件路径（默认: output.mp3）' },
     {
       name: 'encoding',
@@ -226,7 +226,7 @@ cli({
       headers: {
         Authorization:   `Bearer ${token}`,
         'Content-Type':  'application/json',
-        model:           (kwargs.model as string) || 's2-pro',
+        model:           (kwargs.model as string) || 's1',
       },
       body: JSON.stringify(body),
     });
@@ -252,10 +252,136 @@ cli({
     return [{
       file:     outputPath,
       size_kb:  (bytes.byteLength / 1024).toFixed(1),
-      model:    (kwargs.model as string) || 's2-pro',
+      model:    (kwargs.model as string) || 's1',
       voice:    (kwargs.voice as string) || '(默认)',
       encoding,
     }];
+  },
+});
+
+cli({
+  site: 'fishaudio',
+  name: 'my-recent',
+  description: '查看我在 Fish Audio 最近使用过的声音模型（TTS 生成历史）',
+  domain: 'fish.audio',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    { name: 'limit', type: 'int', default: 20, help: '返回数量（默认 20，最多 50）' },
+    { name: 'unique', type: 'bool', default: false, help: '只显示不重复的声音（每个声音只出现一次）' },
+  ],
+  columns: ['date', 'voice_id', 'voice', 'backend', 'text_preview'],
+  func: async (page, kwargs) => {
+    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    const token = await getToken(page);
+
+    const pageSize = Math.min((kwargs.limit as number) ?? 20, 50);
+    const params = new URLSearchParams({
+      state:       'finished',
+      page_size:   String(pageSize),
+      page_number: '1',
+    });
+
+    const data = await apiGet(token, `/task?${params}`) as { total: number; items: unknown[] };
+    if (!data?.items?.length) {
+      throw new CliError(
+        'EMPTY_RESULT',
+        '暂无 TTS 生成记录',
+        '前往 https://fish.audio/zh-CN/app/text-to-speech/ 生成一段语音后再查询',
+      );
+    }
+
+    type TaskItem = {
+      _id: string;
+      backend: string;
+      created_at: string;
+      model?: { _id: string; title: string };
+      parameters?: { text?: string };
+    };
+
+    const items = data.items as TaskItem[];
+    const seen = new Set<string>();
+
+    const rows = items
+      .filter(t => {
+        if (!(kwargs.unique as boolean)) return true;
+        const key = t.model?._id ?? '';
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map(t => ({
+        date:         (t.created_at ?? '').slice(0, 10),
+        voice_id:     t.model?._id ?? '(无)',
+        voice:        t.model?.title ?? '(默认)',
+        backend:      t.backend ?? '—',
+        text_preview: (t.parameters?.text ?? '').slice(0, 40).replace(/\n/g, ' ') + '…',
+      }));
+
+    return rows;
+  },
+});
+
+cli({
+  site: 'fishaudio',
+  name: 'my-favorites',
+  description: '查看我在 Fish Audio 平台上收藏的声音模型（扫描公开模型中已收藏项）',
+  domain: 'fish.audio',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    { name: 'query', type: 'str', default: '', positional: true, help: '声音名称关键词过滤（可选）' },
+    { name: 'language', type: 'str', default: '', help: '按语言过滤，如 zh、en、ja' },
+    {
+      name: 'sort_by',
+      type: 'str',
+      default: 'score',
+      choices: ['score', 'task_count', 'created_at'],
+      help: '排序方式: score | task_count | created_at（默认: score）',
+    },
+    { name: 'limit', type: 'int', default: 20, help: '扫描数量（默认 20，最多 100）' },
+  ],
+  columns: ['id', 'title', 'author', 'languages', 'likes', 'tasks'],
+  func: async (page, kwargs) => {
+    if (!page) throw new CliError('BROWSER_CONNECT', '需要浏览器连接');
+    const token = await getToken(page);
+
+    // fish.audio 公开 API 无专用"收藏列表"端点；
+    // 通过拉取最多 100 条公开模型，筛选当前用户已标记（marked=true）的条目。
+    const scanSize = Math.min((kwargs.limit as number) ?? 20, 100);
+    const params = new URLSearchParams({
+      page_size:   String(scanSize),
+      page_number: '1',
+      sort_by:     (kwargs.sort_by as string) || 'score',
+    });
+    if (kwargs.query)    params.set('title', kwargs.query);
+    if (kwargs.language) params.set('language', kwargs.language);
+
+    const data = await apiGet(token, `/model?${params}`) as { total: number; items: unknown[] };
+    if (!data?.items) {
+      throw new CliError('API_ERROR', '获取模型列表失败');
+    }
+
+    const favorites = (data.items as Record<string, unknown>[]).filter(m => m.marked === true);
+
+    if (!favorites.length) {
+      throw new CliError(
+        'EMPTY_RESULT',
+        `在前 ${scanSize} 条结果中未找到已收藏模型`,
+        '收藏的声音可能排序靠后；请用 --query 关键词缩小范围，或前往 https://fish.audio/discover/ 查看',
+      );
+    }
+
+    return favorites.map(m => ({
+      id:        m._id,
+      title:     m.title,
+      author:    (m.author as Record<string, unknown>)?.nickname ?? '',
+      languages: ((m.languages as string[]) || []).join(', ') || '—',
+      likes:     m.like_count ?? 0,
+      tasks:     m.task_count ?? 0,
+    }));
   },
 });
 

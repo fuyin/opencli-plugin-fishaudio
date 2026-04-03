@@ -1,8 +1,8 @@
 {
   "name": "opencli-plugin-fishaudio",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "type": "module",
-  "description": "OpenCLI plugin: Fish Audio TTS (voices, my-voices, tts, auth-check) using browser login",
+  "description": "OpenCLI plugin: Fish Audio TTS (voices, my-voices, my-recent, my-favorites, tts, auth-check) using browser login",
   "license": "Apache-2.0",
   "peerDependencies": {
     "@jackwener/opencli": ">=1.5.10"
