@@ -1,62 +1,67 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 import { writeFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
-const BASE_URL = "https://api.fish.audio";
+const FISH_DOMAIN = "https://fish.audio";
+const API_DOMAIN = "https://api.fish.audio";
 function fail(message, hint) {
   throw new Error(hint ? `${message}
 \u2192 ${hint}` : message);
 }
 async function getToken(page) {
-  await page.goto("https://fish.audio");
-  await page.wait(2);
-  const result = await page.evaluate(`(async () => {
-    const found = { token: null, tokenKey: null, keys: [], cookieKeys: [] };
-
-    const directToken = localStorage.getItem('token');
-    if (directToken && directToken.trim().length > 10) {
-      found.token = directToken.trim();
-      found.tokenKey = 'localStorage:token';
-    }
-
-    const lsKeys = Object.keys(localStorage);
-    found.keys = lsKeys;
-    if (!found.token) {
-      for (const key of lsKeys) {
-        try {
-          const raw = localStorage.getItem(key);
-          if (!raw || raw.length < 10) continue;
-          if (raw.startsWith('ey') && raw.split('.').length === 3) {
-            found.token = raw; found.tokenKey = 'localStorage:' + key; break;
-          }
+  const currentUrl = await page.evaluate(`(() => location.href)()`);
+  if (!currentUrl?.includes("fish.audio") || currentUrl.includes("api.fish.audio")) {
+    await page.goto(FISH_DOMAIN, { waitUntil: "none", settleMs: 0 });
+    await page.wait(1);
+  }
+  let result = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    result = await page.evaluate(`(async () => {
+      const found = { token: null, tokenKey: null, keys: [], cookieKeys: [] };
+      const directToken = localStorage.getItem('token');
+      if (directToken && directToken.trim().length > 10) {
+        found.token = directToken.trim();
+        found.tokenKey = 'localStorage:token';
+      }
+      const lsKeys = Object.keys(localStorage);
+      found.keys = lsKeys;
+      if (!found.token) {
+        for (const key of lsKeys) {
           try {
-            const obj = JSON.parse(raw);
-            const t = obj?.token || obj?.access_token || obj?.api_key;
-            if (typeof t === 'string' && t.length > 10) {
-              found.token = t; found.tokenKey = 'localStorage:' + key + '.' + (obj.token ? 'token' : obj.access_token ? 'access_token' : 'api_key'); break;
+            const raw = localStorage.getItem(key);
+            if (!raw || raw.length < 10) continue;
+            if (raw.startsWith('ey') && raw.split('.').length === 3) {
+              found.token = raw; found.tokenKey = 'localStorage:' + key; break;
             }
+            try {
+              const obj = JSON.parse(raw);
+              const t = obj?.token || obj?.access_token || obj?.api_key;
+              if (typeof t === 'string' && t.length > 10) {
+                found.token = t; found.tokenKey = 'localStorage:' + key; break;
+              }
+            } catch {}
           } catch {}
-        } catch {}
-      }
-    }
-
-    const cookies = document.cookie.split(';').map(c => c.trim()).filter(Boolean);
-    found.cookieKeys = cookies.map(c => c.split('=')[0]);
-    if (!found.token) {
-      for (const cookie of cookies) {
-        const eqIdx = cookie.indexOf('=');
-        const k = cookie.slice(0, eqIdx).trim();
-        const val = decodeURIComponent(cookie.slice(eqIdx + 1) || '');
-        if (k === 'token' && val.trim().length > 10) {
-          found.token = val.trim(); found.tokenKey = 'cookie:token'; break;
-        }
-        if (val.startsWith('ey') && val.split('.').length === 3) {
-          found.token = val; found.tokenKey = 'cookie:' + k; break;
         }
       }
-    }
-
-    return found;
-  })()`);
+      const cookies = document.cookie.split(';').map(c => c.trim()).filter(Boolean);
+      found.cookieKeys = cookies.map(c => c.split('=')[0]);
+      if (!found.token) {
+        for (const cookie of cookies) {
+          const eqIdx = cookie.indexOf('=');
+          const k = cookie.slice(0, eqIdx).trim();
+          const val = decodeURIComponent(cookie.slice(eqIdx + 1) || '');
+          if (k === 'token' && val.trim().length > 10) {
+            found.token = val.trim(); found.tokenKey = 'cookie:token'; break;
+          }
+          if (val.startsWith('ey') && val.split('.').length === 3) {
+            found.token = val; found.tokenKey = 'cookie:' + k; break;
+          }
+        }
+      }
+      return found;
+    })()`);
+    if (result?.token) break;
+    if (attempt < 2) await page.wait(0.5);
+  }
   if (!result?.token) {
     const lsInfo = result?.keys?.length ? `localStorage keys: [${result.keys.join(", ")}]` : "localStorage is empty";
     const ckInfo = result?.cookieKeys?.length ? `cookies: [${result.cookieKeys.join(", ")}]` : "no cookies";
@@ -68,8 +73,14 @@ async function getToken(page) {
   }
   return result.token;
 }
+async function ensureOnApiDomain(page) {
+  const currentUrl = await page.evaluate(`(() => location.href)()`);
+  if (currentUrl?.includes("api.fish.audio")) return;
+  await page.goto(API_DOMAIN, { waitUntil: "none", settleMs: 0 });
+  await page.wait(0.5);
+}
 async function apiGet(page, token, path) {
-  const url = BASE_URL + path;
+  const url = API_DOMAIN + path;
   const result = await page.evaluate(`(async () => {
     try {
       const res = await fetch(${JSON.stringify(url)}, {
@@ -83,9 +94,7 @@ async function apiGet(page, token, path) {
   })()`);
   const r = result;
   if (!r.ok) {
-    if (r.error) {
-      fail(`\u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25: ${r.error}`, "\u8BF7\u68C0\u67E5\u7F51\u7EDC\u8FDE\u63A5\u6216\u4EE3\u7406\u8BBE\u7F6E");
-    }
+    if (r.error) fail(`\u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25: ${r.error}`, "\u8BF7\u68C0\u67E5\u7F51\u7EDC\u8FDE\u63A5\u6216\u4EE3\u7406\u8BBE\u7F6E");
     const msg = r.body?.message;
     fail(
       msg || `Fish Audio API \u9519\u8BEF ${r.status}`,
@@ -93,6 +102,50 @@ async function apiGet(page, token, path) {
     );
   }
   return r.body;
+}
+async function apiTtsPost(page, token, ttsModel, body) {
+  await ensureOnApiDomain(page);
+  const result = await page.evaluate(`(async () => {
+    try {
+      if (!location.origin.includes('api.fish.audio')) {
+        return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
+      }
+      const res = await fetch('/v1/tts', {
+        method: 'POST',
+        headers: {
+          Authorization:  'Bearer ' + ${JSON.stringify(token)},
+          'Content-Type': 'application/json',
+          model:          ${JSON.stringify(ttsModel)},
+        },
+        body: JSON.stringify(${JSON.stringify(body)}),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        return {
+          ok:      false,
+          status:  res.status,
+          message: err?.message || ('HTTP ' + res.status),
+          hint:    res.status === 401 ? '\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio' :
+                   res.status === 402 ? '\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C' :
+                   undefined,
+        };
+      }
+      const buf   = await res.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      // \u5206\u5757 btoa\uFF1A\u907F\u514D\u8D85\u5927\u97F3\u9891 String.fromCharCode \u6808\u6EA2\u51FA\uFF08\u53C2\u8003 yollomi downloadOutput\uFF09
+      const CHUNK = 65536;
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+      }
+      return { ok: true, base64: btoa(bin), size: bytes.length };
+    } catch (e) {
+      return { ok: false, status: 0, message: String(e) };
+    }
+  })()`);
+  const r = result;
+  if (!r.ok) fail(r.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${r.status})`, r.hint);
+  return { base64: r.base64, size: r.size };
 }
 cli({
   site: "fishaudio",
@@ -212,52 +265,12 @@ cli({
       prosody: { speed }
     };
     if (kwargs.voice) bodyObj.reference_id = kwargs.voice;
-    await page.goto("https://api.fish.audio");
-    await page.wait(1);
-    const ttsResult = await page.evaluate(`(async () => {
-      try {
-        if (!location.origin.includes('api.fish.audio')) {
-          return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
-        }
-        const res = await fetch('/v1/tts', {
-          method: 'POST',
-          headers: {
-            Authorization:  'Bearer ' + ${JSON.stringify(token)},
-            'Content-Type': 'application/json',
-            model:          ${JSON.stringify(ttsModel)},
-          },
-          body: JSON.stringify(${JSON.stringify(bodyObj)}),
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          return {
-            ok:   false,
-            status: res.status,
-            message: err?.message || ('HTTP ' + res.status),
-            hint: res.status === 401 ? '\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u91CD\u65B0\u767B\u5F55 fish.audio' :
-                  res.status === 402 ? '\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C' :
-                  undefined,
-          };
-        }
-        const buf   = await res.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-        // \u5206\u5757 btoa \u907F\u514D\u8D85\u5927\u97F3\u9891 String.fromCharCode \u6808\u6EA2\u51FA
-        const CHUNK = 65536;
-        let bin = '';
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
-        }
-        return { ok: true, base64: btoa(bin), size: bytes.length };
-      } catch (e) {
-        return { ok: false, status: 0, message: String(e) };
-      }
-    })()`);
-    const r = ttsResult;
-    if (!r.ok) {
-      fail(r.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${r.status})`, r.hint);
-    }
+    const { base64, size } = await apiTtsPost(page, token, ttsModel, bodyObj);
     const outputPath = kwargs.output || "output.mp3";
-    const bytes = Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0));
+    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+    if (bytes.byteLength !== size) {
+      fail(`\u97F3\u9891\u6570\u636E\u635F\u574F\uFF08\u671F\u671B ${size} \u5B57\u8282\uFF0C\u5B9E\u9645 ${bytes.byteLength} \u5B57\u8282\uFF09`);
+    }
     const dir = dirname(outputPath);
     if (dir && dir !== ".") mkdirSync(dir, { recursive: true });
     writeFileSync(outputPath, bytes);

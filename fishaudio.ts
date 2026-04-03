@@ -3,15 +3,18 @@
  *
  * 无需 API Key：复用 Chrome 中已登录的 https://fish.audio 会话。
  *
- * 网络架构说明：
- * - voices / my-voices / my-recent / my-favorites：
- *     通过 page.evaluate 在 fish.audio 页面上下文内 fetch，
- *     GET 接口有 CORS 允许，正常工作。
- * - tts：
- *     /v1/tts 为 server-side REST 接口，无浏览器 CORS 头；
- *     fish.audio 前端自身通过 WebSocket 调用 TTS，不走此 HTTP POST。
- *     因此先导航到 https://api.fish.audio，再在同源上下文里 fetch('/v1/tts')，
- *     同源请求无 CORS preflight，同时走 Chrome 网络栈（macOS 代理 / 证书链均正确）。
+ * 网络架构（参考 yollomi 工具函数模式）：
+ *
+ * GET 接口（voices / my-voices / my-recent / my-favorites）：
+ *   停留在 fish.audio 页面上下文，跨域 fetch 到 api.fish.audio；
+ *   这些接口有 CORS 允许头，正常工作。
+ *
+ * POST /v1/tts（TTS 接口）：
+ *   该接口为 server-side REST，无 CORS 头（fish.audio 前端走 WebSocket）。
+ *   仿照 yollomi 的 ensureOnYollomi + 同域 fetch 模式：
+ *   先通过 ensureOnApiDomain 确保页面在 api.fish.audio，
+ *   再发同源 POST（无 preflight），完全走 Chrome 网络栈。
+ *   二进制响应用分块 btoa 转 base64 经 CDP 桥返回 Node.js 写文件。
  *
  * @see https://github.com/jackwener/opencli-plugin-fishaudio
  */
@@ -20,7 +23,8 @@ import { cli, Strategy, type IPage } from '@jackwener/opencli/registry';
 import { writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 
-const BASE_URL = 'https://api.fish.audio';
+const FISH_DOMAIN   = 'https://fish.audio';
+const API_DOMAIN    = 'https://api.fish.audio';
 
 /**
  * 统一报错：不依赖 @jackwener/opencli/registry 中的 CliError，
@@ -30,59 +34,70 @@ function fail(message: string, hint?: string): never {
   throw new Error(hint ? `${message}\n→ ${hint}` : message);
 }
 
-/** 从 localStorage / cookie 中提取 fish.audio token（在浏览器上下文内运行）。 */
+/**
+ * 从 fish.audio localStorage / cookie 中提取 Bearer token。
+ *
+ * 优化：用轮询代替死等 2 秒——localStorage 在页面 hydrate 后才写入，
+ * 最多轮询 3 次（每次 500 ms），已登录用户通常第 1 次就能拿到。
+ */
 async function getToken(page: IPage): Promise<string> {
-  await page.goto('https://fish.audio');
-  await page.wait(2);
+  const currentUrl = await page.evaluate(`(() => location.href)()`) as string;
+  if (!currentUrl?.includes('fish.audio') || currentUrl.includes('api.fish.audio')) {
+    await page.goto(FISH_DOMAIN, { waitUntil: 'none', settleMs: 0 });
+    await page.wait(1);
+  }
 
-  const result = await page.evaluate(`(async () => {
-    const found = { token: null, tokenKey: null, keys: [], cookieKeys: [] };
-
-    const directToken = localStorage.getItem('token');
-    if (directToken && directToken.trim().length > 10) {
-      found.token = directToken.trim();
-      found.tokenKey = 'localStorage:token';
-    }
-
-    const lsKeys = Object.keys(localStorage);
-    found.keys = lsKeys;
-    if (!found.token) {
-      for (const key of lsKeys) {
-        try {
-          const raw = localStorage.getItem(key);
-          if (!raw || raw.length < 10) continue;
-          if (raw.startsWith('ey') && raw.split('.').length === 3) {
-            found.token = raw; found.tokenKey = 'localStorage:' + key; break;
-          }
+  // 轮询提取 token（最多 3 次，间隔 500 ms），避免死等 2 秒
+  let result: { token: string | null; keys: string[]; cookieKeys: string[] } | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    result = await page.evaluate(`(async () => {
+      const found = { token: null, tokenKey: null, keys: [], cookieKeys: [] };
+      const directToken = localStorage.getItem('token');
+      if (directToken && directToken.trim().length > 10) {
+        found.token = directToken.trim();
+        found.tokenKey = 'localStorage:token';
+      }
+      const lsKeys = Object.keys(localStorage);
+      found.keys = lsKeys;
+      if (!found.token) {
+        for (const key of lsKeys) {
           try {
-            const obj = JSON.parse(raw);
-            const t = obj?.token || obj?.access_token || obj?.api_key;
-            if (typeof t === 'string' && t.length > 10) {
-              found.token = t; found.tokenKey = 'localStorage:' + key + '.' + (obj.token ? 'token' : obj.access_token ? 'access_token' : 'api_key'); break;
+            const raw = localStorage.getItem(key);
+            if (!raw || raw.length < 10) continue;
+            if (raw.startsWith('ey') && raw.split('.').length === 3) {
+              found.token = raw; found.tokenKey = 'localStorage:' + key; break;
             }
+            try {
+              const obj = JSON.parse(raw);
+              const t = obj?.token || obj?.access_token || obj?.api_key;
+              if (typeof t === 'string' && t.length > 10) {
+                found.token = t; found.tokenKey = 'localStorage:' + key; break;
+              }
+            } catch {}
           } catch {}
-        } catch {}
-      }
-    }
-
-    const cookies = document.cookie.split(';').map(c => c.trim()).filter(Boolean);
-    found.cookieKeys = cookies.map(c => c.split('=')[0]);
-    if (!found.token) {
-      for (const cookie of cookies) {
-        const eqIdx = cookie.indexOf('=');
-        const k = cookie.slice(0, eqIdx).trim();
-        const val = decodeURIComponent(cookie.slice(eqIdx + 1) || '');
-        if (k === 'token' && val.trim().length > 10) {
-          found.token = val.trim(); found.tokenKey = 'cookie:token'; break;
-        }
-        if (val.startsWith('ey') && val.split('.').length === 3) {
-          found.token = val; found.tokenKey = 'cookie:' + k; break;
         }
       }
-    }
+      const cookies = document.cookie.split(';').map(c => c.trim()).filter(Boolean);
+      found.cookieKeys = cookies.map(c => c.split('=')[0]);
+      if (!found.token) {
+        for (const cookie of cookies) {
+          const eqIdx = cookie.indexOf('=');
+          const k = cookie.slice(0, eqIdx).trim();
+          const val = decodeURIComponent(cookie.slice(eqIdx + 1) || '');
+          if (k === 'token' && val.trim().length > 10) {
+            found.token = val.trim(); found.tokenKey = 'cookie:token'; break;
+          }
+          if (val.startsWith('ey') && val.split('.').length === 3) {
+            found.token = val; found.tokenKey = 'cookie:' + k; break;
+          }
+        }
+      }
+      return found;
+    })()`) as { token: string | null; keys: string[]; cookieKeys: string[] };
 
-    return found;
-  })()`) as { token: string | null; tokenKey?: string; keys: string[]; cookieKeys: string[] };
+    if (result?.token) break;
+    if (attempt < 2) await page.wait(0.5);
+  }
 
   if (!result?.token) {
     const lsInfo = result?.keys?.length  ? `localStorage keys: [${result.keys.join(', ')}]` : 'localStorage is empty';
@@ -93,15 +108,28 @@ async function getToken(page: IPage): Promise<string> {
     );
   }
 
-  return result.token;
+  return result.token!;
 }
 
 /**
- * 通过浏览器执行 GET 请求，完全复用 Chrome 网络栈。
+ * 确保当前页面在 api.fish.audio 域（参考 yollomi 的 ensureOnYollomi 模式）。
+ * 若已在该域则跳过导航，节省 1-2 秒。
+ */
+async function ensureOnApiDomain(page: IPage): Promise<void> {
+  const currentUrl = await page.evaluate(`(() => location.href)()`) as string;
+  if (currentUrl?.includes('api.fish.audio')) return;
+  // waitUntil: 'none' 不等待页面加载完成，settleMs: 0 不额外等待；
+  // CDP 执行 JS 不需要 DOM 就绪，只需建立正确的 origin 上下文即可。
+  await page.goto(API_DOMAIN, { waitUntil: 'none', settleMs: 0 });
+  await page.wait(0.5);
+}
+
+/**
+ * 通过浏览器执行跨域 GET 请求（从 fish.audio 页上下文请求 api.fish.audio）。
  * 返回已解析的 JSON；失败时 fail()。
  */
 async function apiGet(page: IPage, token: string, path: string): Promise<unknown> {
-  const url = BASE_URL + path;
+  const url = API_DOMAIN + path;
   const result = await page.evaluate(`(async () => {
     try {
       const res = await fetch(${JSON.stringify(url)}, {
@@ -117,9 +145,7 @@ async function apiGet(page: IPage, token: string, path: string): Promise<unknown
   const r = result as { ok: boolean; status: number; body?: unknown; error?: string };
 
   if (!r.ok) {
-    if (r.error) {
-      fail(`网络请求失败: ${r.error}`, '请检查网络连接或代理设置');
-    }
+    if (r.error) fail(`网络请求失败: ${r.error}`, '请检查网络连接或代理设置');
     const msg = (r.body as Record<string, unknown>)?.message as string | undefined;
     fail(
       msg || `Fish Audio API 错误 ${r.status}`,
@@ -128,6 +154,68 @@ async function apiGet(page: IPage, token: string, path: string): Promise<unknown
   }
 
   return r.body;
+}
+
+/**
+ * 在 api.fish.audio 同源上下文中发 POST，返回二进制音频 base64。
+ *
+ * 仿 yollomi yollomiPost：先 ensureOnApiDomain，再 page.evaluate fetch。
+ * 同源请求无 CORS preflight；Chrome 网络栈在 macOS/企业网络下均正常。
+ * 二进制响应通过分块 btoa 编码后经 CDP 桥转回 Node.js。
+ */
+async function apiTtsPost(
+  page: IPage,
+  token: string,
+  ttsModel: string,
+  body: Record<string, unknown>,
+): Promise<{ base64: string; size: number }> {
+  await ensureOnApiDomain(page);
+
+  const result = await page.evaluate(`(async () => {
+    try {
+      if (!location.origin.includes('api.fish.audio')) {
+        return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
+      }
+      const res = await fetch('/v1/tts', {
+        method: 'POST',
+        headers: {
+          Authorization:  'Bearer ' + ${JSON.stringify(token)},
+          'Content-Type': 'application/json',
+          model:          ${JSON.stringify(ttsModel)},
+        },
+        body: JSON.stringify(${JSON.stringify(body)}),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        return {
+          ok:      false,
+          status:  res.status,
+          message: err?.message || ('HTTP ' + res.status),
+          hint:    res.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
+                   res.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
+                   undefined,
+        };
+      }
+      const buf   = await res.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      // 分块 btoa：避免超大音频 String.fromCharCode 栈溢出（参考 yollomi downloadOutput）
+      const CHUNK = 65536;
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+      }
+      return { ok: true, base64: btoa(bin), size: bytes.length };
+    } catch (e) {
+      return { ok: false, status: 0, message: String(e) };
+    }
+  })()`);
+
+  const r = result as {
+    ok: boolean; status?: number; base64?: string; size?: number; message?: string; hint?: string;
+  };
+
+  if (!r.ok) fail(r.message || `TTS 请求失败 (${r.status})`, r.hint);
+  return { base64: r.base64!, size: r.size! };
 }
 
 
@@ -260,60 +348,13 @@ cli({
     };
     if (kwargs.voice) bodyObj.reference_id = kwargs.voice;
 
-    // 策略：导航到 https://api.fish.audio，在同源上下文里发 POST /v1/tts。
-    // 同源请求无 CORS preflight，同时走 Chrome 网络栈（macOS 代理/证书均正确）。
-    await page.goto('https://api.fish.audio');
-    await page.wait(1);
-
-    const ttsResult = await page.evaluate(`(async () => {
-      try {
-        if (!location.origin.includes('api.fish.audio')) {
-          return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
-        }
-        const res = await fetch('/v1/tts', {
-          method: 'POST',
-          headers: {
-            Authorization:  'Bearer ' + ${JSON.stringify(token)},
-            'Content-Type': 'application/json',
-            model:          ${JSON.stringify(ttsModel)},
-          },
-          body: JSON.stringify(${JSON.stringify(bodyObj)}),
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          return {
-            ok:   false,
-            status: res.status,
-            message: err?.message || ('HTTP ' + res.status),
-            hint: res.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
-                  res.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
-                  undefined,
-          };
-        }
-        const buf   = await res.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-        // 分块 btoa 避免超大音频 String.fromCharCode 栈溢出
-        const CHUNK = 65536;
-        let bin = '';
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
-        }
-        return { ok: true, base64: btoa(bin), size: bytes.length };
-      } catch (e) {
-        return { ok: false, status: 0, message: String(e) };
-      }
-    })()`);
-
-    const r = ttsResult as {
-      ok: boolean; status?: number; base64?: string; size?: number; message?: string; hint?: string;
-    };
-
-    if (!r.ok) {
-      fail(r.message || `TTS 请求失败 (${r.status})`, r.hint);
-    }
+    const { base64, size } = await apiTtsPost(page, token, ttsModel, bodyObj);
 
     const outputPath: string = (kwargs.output as string) || 'output.mp3';
-    const bytes = Uint8Array.from(atob(r.base64!), c => c.charCodeAt(0));
+    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    if (bytes.byteLength !== size) {
+      fail(`音频数据损坏（期望 ${size} 字节，实际 ${bytes.byteLength} 字节）`);
+    }
 
     const dir = dirname(outputPath);
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
