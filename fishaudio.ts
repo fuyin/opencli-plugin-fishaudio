@@ -12,6 +12,7 @@
 import { cli, Strategy, type IPage } from '@jackwener/opencli/registry';
 import { writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
+import { request as httpsRequest } from 'node:https';
 
 const BASE_URL = 'https://api.fish.audio';
 
@@ -121,6 +122,54 @@ async function apiGet(page: IPage, token: string, path: string): Promise<unknown
   }
 
   return r.body;
+}
+
+/**
+ * 通过 Node.js node:https 模块向 api.fish.audio 发 POST，返回二进制 Buffer。
+ *
+ * 原因：/v1/tts 是 server-side REST 接口，无浏览器 CORS 头；
+ * fish.audio 前端自身通过 WebSocket 做 TTS，不走此 HTTP 接口。
+ * 因此浏览器 page.evaluate fetch 会被 CORS preflight 阻断。
+ *
+ * 同时，Node.js 全局 fetch（undici）在 macOS 上有时因 SSL/proxy
+ * 问题报 "fetch failed"；node:https 使用不同的 TLS 实现，更兼容。
+ */
+function nodeTtsPost(
+  token: string,
+  ttsModel: string,
+  bodyObj: Record<string, unknown>,
+): Promise<{ ok: boolean; status: number; data: Buffer; errMsg?: string }> {
+  const bodyStr = JSON.stringify(bodyObj);
+  const bodyBuf = Buffer.from(bodyStr, 'utf8');
+
+  return new Promise((resolve) => {
+    const req = httpsRequest(
+      {
+        hostname: 'api.fish.audio',
+        path:     '/v1/tts',
+        method:   'POST',
+        headers:  {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type':  'application/json',
+          'model':         ttsModel,
+          'Content-Length': String(bodyBuf.length),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data',  (chunk: Buffer) => chunks.push(chunk));
+        res.on('end',   () => resolve({
+          ok:     (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
+          status: res.statusCode ?? 0,
+          data:   Buffer.concat(chunks),
+        }));
+        res.on('error', (err: Error) => resolve({ ok: false, status: 0, data: Buffer.alloc(0), errMsg: err.message }));
+      },
+    );
+    req.on('error', (err: Error) => resolve({ ok: false, status: 0, data: Buffer.alloc(0), errMsg: err.message }));
+    req.write(bodyBuf);
+    req.end();
+  });
 }
 
 cli({
@@ -252,45 +301,31 @@ cli({
     };
     if (kwargs.voice) bodyObj.reference_id = kwargs.voice;
 
-    // TTS 返回二进制音频，在浏览器内读取并转为 base64 后传回 Node.js
-    const ttsResult = await page.evaluate(`(async () => {
-      try {
-        const res = await fetch('${BASE_URL}/v1/tts', {
-          method: 'POST',
-          headers: {
-            Authorization:  'Bearer ' + ${JSON.stringify(token)},
-            'Content-Type': 'application/json',
-            model:          ${JSON.stringify(ttsModel)},
-          },
-          body: JSON.stringify(${JSON.stringify(bodyObj)}),
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          const hint =
-            res.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
-            res.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
-            undefined;
-          return { ok: false, status: res.status, message: err?.message, hint };
-        }
-        // 读取二进制并转 base64 以便传回 Node.js
-        const buf = await res.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-        let bin = '';
-        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-        return { ok: true, base64: btoa(bin), size: bytes.length };
-      } catch (e) {
-        return { ok: false, status: 0, message: String(e), hint: '请检查网络连接或代理设置' };
+    // 使用 node:https 直接发 POST（非浏览器 fetch）：
+    // /v1/tts 是 server-side 接口，无 CORS 头，浏览器 page.evaluate fetch 会被阻断；
+    // 同时规避 macOS 下 undici/fetch 的 SSL/proxy 兼容性问题。
+    const ttsResult = await nodeTtsPost(token, ttsModel, bodyObj);
+
+    if (!ttsResult.ok) {
+      if (ttsResult.errMsg) {
+        // Node.js 网络层错误
+        fail(
+          `TTS 网络请求失败: ${ttsResult.errMsg}`,
+          '请检查网络连接，或尝试设置 HTTPS_PROXY 环境变量',
+        );
       }
-    })()`);
-
-    const r = ttsResult as { ok: boolean; status?: number; base64?: string; size?: number; message?: string; hint?: string };
-
-    if (!r.ok) {
-      fail(r.message || `TTS 请求失败 (${r.status})`, r.hint);
+      // HTTP 错误码
+      let errMsg = `TTS 请求失败 (${ttsResult.status})`;
+      try { errMsg = (JSON.parse(ttsResult.data.toString('utf8')) as Record<string, unknown>)?.message as string || errMsg; } catch {}
+      const hint =
+        ttsResult.status === 401 ? '登录态已过期，请在 Chrome 重新登录 fish.audio' :
+        ttsResult.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
+        undefined;
+      fail(errMsg, hint);
     }
 
     const outputPath: string = (kwargs.output as string) || 'output.mp3';
-    const bytes = Uint8Array.from(atob(r.base64!), c => c.charCodeAt(0));
+    const bytes = new Uint8Array(ttsResult.data);
 
     const dir = dirname(outputPath);
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
