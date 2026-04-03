@@ -7,7 +7,7 @@
 需要已安装 OpenCLI（>= 1.5.9，且包含将 `CliError` 导出到 `@jackwener/opencli/registry` 的版本）。
 
 ```bash
-opencli plugin install github:jackwener/opencli-plugin-fishaudio
+opencli plugin install github:fuyin/opencli-plugin-fishaudio
 ```
 
 开发时可本地链接：
