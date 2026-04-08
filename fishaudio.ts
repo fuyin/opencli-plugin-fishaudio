@@ -20,8 +20,8 @@
  */
 
 import { cli, Strategy, type IPage } from '@jackwener/opencli/registry';
-import { writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
+import { dirname, basename, extname } from 'path';
 
 const FISH_DOMAIN   = 'https://fish.audio';
 const API_DOMAIN    = 'https://api.fish.audio';
@@ -218,6 +218,150 @@ async function apiTtsPost(
   return { base64: r.base64!, size: r.size! };
 }
 
+
+/**
+ * 声音克隆：用 Node.js 原生 fetch 向 api.fish.audio 发送 multipart/form-data，
+ * 直接携带 Bearer token，无需在浏览器内执行（规避 CORS 限制同时支持大文件上传）。
+ *
+ * Fish Audio Model Create API：POST /model
+ *   - title          声音名称（必填）
+ *   - description    描述（可选）
+ *   - enhance_audio_quality  是否增强音质（默认 true）
+ *   - languages      语言代码（可重复，如 "zh" "en"）
+ *   - voices         音频二进制（可多个，字段名重复）
+ *   - voices_texts   对应的文字转录（可选，与 voices 等长）
+ */
+async function apiCreateModel(
+  token: string,
+  title: string,
+  audioFiles: { path: string; text?: string }[],
+  opts: { language?: string; description?: string; enhance?: boolean },
+): Promise<Record<string, unknown>> {
+  const formData = new FormData();
+  formData.append('title', title);
+  if (opts.description) formData.append('description', opts.description);
+  formData.append('enhance_audio_quality', String(opts.enhance !== false));
+
+  const lang = (opts.language || 'zh').trim();
+  // 支持用逗号传多语言，如 "zh,en"
+  for (const l of lang.split(',').map(s => s.trim()).filter(Boolean)) {
+    formData.append('languages', l);
+  }
+
+  const MIME: Record<string, string> = {
+    wav:  'audio/wav',
+    mp3:  'audio/mpeg',
+    m4a:  'audio/mp4',
+    ogg:  'audio/ogg',
+    flac: 'audio/flac',
+    webm: 'audio/webm',
+  };
+
+  for (const file of audioFiles) {
+    if (!existsSync(file.path)) {
+      fail(`音频文件不存在: ${file.path}`, '请检查文件路径是否正确');
+    }
+    const buf      = readFileSync(file.path);
+    const fname    = basename(file.path);
+    const ext      = extname(fname).slice(1).toLowerCase();
+    const mimeType = MIME[ext] ?? 'audio/mpeg';
+
+    formData.append('voices', new Blob([buf], { type: mimeType }), fname);
+    if (file.text) formData.append('voices_texts', file.text);
+  }
+
+  const response = await fetch(`${API_DOMAIN}/model`, {
+    method:  'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body:    formData,
+  });
+
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) {
+    const msg  = (body?.message as string) || `API 错误 ${response.status}`;
+    const hint =
+      response.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' :
+      response.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
+      undefined;
+    fail(msg, hint);
+  }
+  return body;
+}
+
+cli({
+  site: 'fishaudio',
+  name: 'clone',
+  description: '声音克隆：上传音频文件创建自定义声音模型，需为声音取名',
+  domain: 'fish.audio',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    {
+      name:     'audio',
+      type:     'str',
+      required: true,
+      positional: true,
+      help:     '音频文件路径（WAV/MP3/M4A/FLAC；多个文件用英文逗号分隔，15-300 秒效果最佳）',
+    },
+    {
+      name:     'name',
+      type:     'str',
+      required: true,
+      help:     '声音名称（必填，例如：小明的声音）',
+    },
+    {
+      name:    'text',
+      type:    'str',
+      default: '',
+      help:    '音频对应的文字转录（可选，填写后克隆质量更好）',
+    },
+    {
+      name:    'language',
+      type:    'str',
+      default: 'zh',
+      help:    '语言代码: zh | en | ja | ko | ...（默认: zh；多语言用逗号，如 zh,en）',
+    },
+    {
+      name:    'description',
+      type:    'str',
+      default: '',
+      help:    '声音描述（可选）',
+    },
+    {
+      name:    'enhance',
+      type:    'bool',
+      default: true,
+      help:    '是否增强音频质量（默认: true）',
+    },
+  ],
+  columns: ['id', 'name', 'state', 'languages'],
+  func: async (page, kwargs) => {
+    if (!page) fail('需要浏览器连接');
+    const token = await getToken(page);
+
+    const rawPaths = (kwargs.audio as string).split(',').map(p => p.trim()).filter(Boolean);
+    if (!rawPaths.length) fail('请提供至少一个音频文件路径');
+
+    const audioFiles = rawPaths.map(p => ({
+      path: p,
+      text: (kwargs.text as string) || undefined,
+    }));
+
+    const result = await apiCreateModel(token, kwargs.name as string, audioFiles, {
+      language:    (kwargs.language as string) || 'zh',
+      description: (kwargs.description as string) || '',
+      enhance:     kwargs.enhance !== false,
+    });
+
+    return [{
+      id:        result._id ?? result.id ?? '—',
+      name:      result.title ?? kwargs.name,
+      state:     result.state ?? 'processing',
+      languages: ((result.languages as string[]) || []).join(', ') || (kwargs.language as string) || 'zh',
+    }];
+  },
+});
 
 cli({
   site: 'fishaudio',

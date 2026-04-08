@@ -1,6 +1,6 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
-import { writeFileSync, mkdirSync } from "fs";
-import { dirname } from "path";
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from "fs";
+import { dirname, basename, extname } from "path";
 const FISH_DOMAIN = "https://fish.audio";
 const API_DOMAIN = "https://api.fish.audio";
 function fail(message, hint) {
@@ -147,6 +147,117 @@ async function apiTtsPost(page, token, ttsModel, body) {
   if (!r.ok) fail(r.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${r.status})`, r.hint);
   return { base64: r.base64, size: r.size };
 }
+async function apiCreateModel(token, title, audioFiles, opts) {
+  const formData = new FormData();
+  formData.append("title", title);
+  if (opts.description) formData.append("description", opts.description);
+  formData.append("enhance_audio_quality", String(opts.enhance !== false));
+  const lang = (opts.language || "zh").trim();
+  for (const l of lang.split(",").map((s) => s.trim()).filter(Boolean)) {
+    formData.append("languages", l);
+  }
+  const MIME = {
+    wav: "audio/wav",
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    ogg: "audio/ogg",
+    flac: "audio/flac",
+    webm: "audio/webm"
+  };
+  for (const file of audioFiles) {
+    if (!existsSync(file.path)) {
+      fail(`\u97F3\u9891\u6587\u4EF6\u4E0D\u5B58\u5728: ${file.path}`, "\u8BF7\u68C0\u67E5\u6587\u4EF6\u8DEF\u5F84\u662F\u5426\u6B63\u786E");
+    }
+    const buf = readFileSync(file.path);
+    const fname = basename(file.path);
+    const ext = extname(fname).slice(1).toLowerCase();
+    const mimeType = MIME[ext] ?? "audio/mpeg";
+    formData.append("voices", new Blob([buf], { type: mimeType }), fname);
+    if (file.text) formData.append("voices_texts", file.text);
+  }
+  const response = await fetch(`${API_DOMAIN}/model`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const msg = body?.message || `API \u9519\u8BEF ${response.status}`;
+    const hint = response.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : response.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : void 0;
+    fail(msg, hint);
+  }
+  return body;
+}
+cli({
+  site: "fishaudio",
+  name: "clone",
+  description: "\u58F0\u97F3\u514B\u9686\uFF1A\u4E0A\u4F20\u97F3\u9891\u6587\u4EF6\u521B\u5EFA\u81EA\u5B9A\u4E49\u58F0\u97F3\u6A21\u578B\uFF0C\u9700\u4E3A\u58F0\u97F3\u53D6\u540D",
+  domain: "fish.audio",
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    {
+      name: "audio",
+      type: "str",
+      required: true,
+      positional: true,
+      help: "\u97F3\u9891\u6587\u4EF6\u8DEF\u5F84\uFF08WAV/MP3/M4A/FLAC\uFF1B\u591A\u4E2A\u6587\u4EF6\u7528\u82F1\u6587\u9017\u53F7\u5206\u9694\uFF0C15-300 \u79D2\u6548\u679C\u6700\u4F73\uFF09"
+    },
+    {
+      name: "name",
+      type: "str",
+      required: true,
+      help: "\u58F0\u97F3\u540D\u79F0\uFF08\u5FC5\u586B\uFF0C\u4F8B\u5982\uFF1A\u5C0F\u660E\u7684\u58F0\u97F3\uFF09"
+    },
+    {
+      name: "text",
+      type: "str",
+      default: "",
+      help: "\u97F3\u9891\u5BF9\u5E94\u7684\u6587\u5B57\u8F6C\u5F55\uFF08\u53EF\u9009\uFF0C\u586B\u5199\u540E\u514B\u9686\u8D28\u91CF\u66F4\u597D\uFF09"
+    },
+    {
+      name: "language",
+      type: "str",
+      default: "zh",
+      help: "\u8BED\u8A00\u4EE3\u7801: zh | en | ja | ko | ...\uFF08\u9ED8\u8BA4: zh\uFF1B\u591A\u8BED\u8A00\u7528\u9017\u53F7\uFF0C\u5982 zh,en\uFF09"
+    },
+    {
+      name: "description",
+      type: "str",
+      default: "",
+      help: "\u58F0\u97F3\u63CF\u8FF0\uFF08\u53EF\u9009\uFF09"
+    },
+    {
+      name: "enhance",
+      type: "bool",
+      default: true,
+      help: "\u662F\u5426\u589E\u5F3A\u97F3\u9891\u8D28\u91CF\uFF08\u9ED8\u8BA4: true\uFF09"
+    }
+  ],
+  columns: ["id", "name", "state", "languages"],
+  func: async (page, kwargs) => {
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    const token = await getToken(page);
+    const rawPaths = kwargs.audio.split(",").map((p) => p.trim()).filter(Boolean);
+    if (!rawPaths.length) fail("\u8BF7\u63D0\u4F9B\u81F3\u5C11\u4E00\u4E2A\u97F3\u9891\u6587\u4EF6\u8DEF\u5F84");
+    const audioFiles = rawPaths.map((p) => ({
+      path: p,
+      text: kwargs.text || void 0
+    }));
+    const result = await apiCreateModel(token, kwargs.name, audioFiles, {
+      language: kwargs.language || "zh",
+      description: kwargs.description || "",
+      enhance: kwargs.enhance !== false
+    });
+    return [{
+      id: result._id ?? result.id ?? "\u2014",
+      name: result.title ?? kwargs.name,
+      state: result.state ?? "processing",
+      languages: (result.languages || []).join(", ") || kwargs.language || "zh"
+    }];
+  }
+});
 cli({
   site: "fishaudio",
   name: "voices",
