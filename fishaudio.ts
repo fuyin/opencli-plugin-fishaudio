@@ -707,3 +707,94 @@ cli({
     }];
   },
 });
+
+/** 提取 token 的内联 JS（与 getToken 保持一致，供 login 轮询使用）*/
+const EXTRACT_TOKEN_JS = `(async () => {
+  const found = { token: null };
+  const direct = localStorage.getItem('token');
+  if (direct && direct.trim().length > 10) { found.token = direct.trim(); return found; }
+  for (const key of Object.keys(localStorage)) {
+    try {
+      const raw = localStorage.getItem(key) || '';
+      if (raw.length < 10) continue;
+      if (raw.startsWith('ey') && raw.split('.').length === 3) { found.token = raw; return found; }
+      try {
+        const obj = JSON.parse(raw);
+        const t = obj?.token || obj?.access_token || obj?.api_key;
+        if (typeof t === 'string' && t.length > 10) { found.token = t; return found; }
+      } catch {}
+    } catch {}
+  }
+  for (const cookie of document.cookie.split(';').map(c => c.trim()).filter(Boolean)) {
+    const eq = cookie.indexOf('=');
+    const val = decodeURIComponent(cookie.slice(eq + 1) || '');
+    if (cookie.slice(0, eq).trim() === 'token' && val.length > 10) { found.token = val; return found; }
+    if (val.startsWith('ey') && val.split('.').length === 3) { found.token = val; return found; }
+  }
+  return found;
+})()`;
+
+cli({
+  site: 'fishaudio',
+  name: 'login',
+  description: '在 Chrome 中打开 Fish Audio 登录页，完成登录后自动确认 token 已写入',
+  domain: 'fish.audio',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    {
+      name:    'timeout',
+      type:    'int',
+      default: 120,
+      help:    '等待登录完成的最长秒数（默认 120 秒）',
+    },
+  ],
+  columns: ['status', 'token_prefix'],
+  func: async (page, kwargs) => {
+    if (!page) fail('需要浏览器连接');
+
+    const LOGIN_URL = `${FISH_DOMAIN}/zh-CN/auth/?redirect=%2Fapp%2F`;
+
+    // 先检查是否已经登录，已登录则无需重复跳转
+    const currentUrl = await page.evaluate(`(() => location.href)()`) as string;
+    if (currentUrl?.includes('fish.audio') && !currentUrl.includes('api.fish.audio')) {
+      const pre = await page.evaluate(EXTRACT_TOKEN_JS) as { token: string | null };
+      if (pre.token) {
+        return [{
+          status:       '✅ 已登录（无需重新登录）',
+          token_prefix: pre.token.slice(0, 20) + '...',
+        }];
+      }
+    }
+
+    // 导航到登录页
+    await page.goto(LOGIN_URL, { waitUntil: 'none', settleMs: 0 });
+
+    // 轮询等待用户完成登录（每 2 秒检查一次 token）
+    const maxSeconds = Math.max(10, (kwargs.timeout as number) ?? 120);
+    const interval   = 2;
+    const maxTries   = Math.ceil(maxSeconds / interval);
+
+    let token: string | null = null;
+    for (let i = 0; i < maxTries; i++) {
+      await page.wait(interval);
+
+      // 页面可能在登录后跳转到 /app/，重新确认 token
+      const r = await page.evaluate(EXTRACT_TOKEN_JS) as { token: string | null };
+      if (r.token) { token = r.token; break; }
+    }
+
+    if (!token) {
+      fail(
+        `等待超时（${maxSeconds} 秒内未检测到登录 token）`,
+        '请确认已在浏览器窗口中完成账号密码或第三方登录，或用 --timeout 延长等待时间',
+      );
+    }
+
+    return [{
+      status:       '✅ 登录成功',
+      token_prefix: token!.slice(0, 20) + '...',
+    }];
+  },
+});

@@ -562,3 +562,82 @@ cli({
     }];
   }
 });
+const EXTRACT_TOKEN_JS = `(async () => {
+  const found = { token: null };
+  const direct = localStorage.getItem('token');
+  if (direct && direct.trim().length > 10) { found.token = direct.trim(); return found; }
+  for (const key of Object.keys(localStorage)) {
+    try {
+      const raw = localStorage.getItem(key) || '';
+      if (raw.length < 10) continue;
+      if (raw.startsWith('ey') && raw.split('.').length === 3) { found.token = raw; return found; }
+      try {
+        const obj = JSON.parse(raw);
+        const t = obj?.token || obj?.access_token || obj?.api_key;
+        if (typeof t === 'string' && t.length > 10) { found.token = t; return found; }
+      } catch {}
+    } catch {}
+  }
+  for (const cookie of document.cookie.split(';').map(c => c.trim()).filter(Boolean)) {
+    const eq = cookie.indexOf('=');
+    const val = decodeURIComponent(cookie.slice(eq + 1) || '');
+    if (cookie.slice(0, eq).trim() === 'token' && val.length > 10) { found.token = val; return found; }
+    if (val.startsWith('ey') && val.split('.').length === 3) { found.token = val; return found; }
+  }
+  return found;
+})()`;
+cli({
+  site: "fishaudio",
+  name: "login",
+  description: "\u5728 Chrome \u4E2D\u6253\u5F00 Fish Audio \u767B\u5F55\u9875\uFF0C\u5B8C\u6210\u767B\u5F55\u540E\u81EA\u52A8\u786E\u8BA4 token \u5DF2\u5199\u5165",
+  domain: "fish.audio",
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    {
+      name: "timeout",
+      type: "int",
+      default: 120,
+      help: "\u7B49\u5F85\u767B\u5F55\u5B8C\u6210\u7684\u6700\u957F\u79D2\u6570\uFF08\u9ED8\u8BA4 120 \u79D2\uFF09"
+    }
+  ],
+  columns: ["status", "token_prefix"],
+  func: async (page, kwargs) => {
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    const LOGIN_URL = `${FISH_DOMAIN}/zh-CN/auth/?redirect=%2Fapp%2F`;
+    const currentUrl = await page.evaluate(`(() => location.href)()`);
+    if (currentUrl?.includes("fish.audio") && !currentUrl.includes("api.fish.audio")) {
+      const pre = await page.evaluate(EXTRACT_TOKEN_JS);
+      if (pre.token) {
+        return [{
+          status: "\u2705 \u5DF2\u767B\u5F55\uFF08\u65E0\u9700\u91CD\u65B0\u767B\u5F55\uFF09",
+          token_prefix: pre.token.slice(0, 20) + "..."
+        }];
+      }
+    }
+    await page.goto(LOGIN_URL, { waitUntil: "none", settleMs: 0 });
+    const maxSeconds = Math.max(10, kwargs.timeout ?? 120);
+    const interval = 2;
+    const maxTries = Math.ceil(maxSeconds / interval);
+    let token = null;
+    for (let i = 0; i < maxTries; i++) {
+      await page.wait(interval);
+      const r = await page.evaluate(EXTRACT_TOKEN_JS);
+      if (r.token) {
+        token = r.token;
+        break;
+      }
+    }
+    if (!token) {
+      fail(
+        `\u7B49\u5F85\u8D85\u65F6\uFF08${maxSeconds} \u79D2\u5185\u672A\u68C0\u6D4B\u5230\u767B\u5F55 token\uFF09`,
+        "\u8BF7\u786E\u8BA4\u5DF2\u5728\u6D4F\u89C8\u5668\u7A97\u53E3\u4E2D\u5B8C\u6210\u8D26\u53F7\u5BC6\u7801\u6216\u7B2C\u4E09\u65B9\u767B\u5F55\uFF0C\u6216\u7528 --timeout \u5EF6\u957F\u7B49\u5F85\u65F6\u95F4"
+      );
+    }
+    return [{
+      status: "\u2705 \u767B\u5F55\u6210\u529F",
+      token_prefix: token.slice(0, 20) + "..."
+    }];
+  }
+});

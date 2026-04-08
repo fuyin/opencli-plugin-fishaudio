@@ -23,6 +23,7 @@ opencli plugin install file:///绝对路径/opencli-plugin-fishaudio
 
 | 命令 | 说明 |
 |------|------|
+| `opencli fishaudio login` | 打开登录页，自动等待用户完成登录并确认 token 写入 |
 | `opencli fishaudio auth-check` | 诊断是否已从页面读到登录 token |
 | `opencli fishaudio voices` | 浏览公开声音（可 `--language zh`、`--limit` 等） |
 | `opencli fishaudio my-voices` | 我的声音模型（自己创建/上传的） |
@@ -80,6 +81,8 @@ opencli fishaudio tts "你好" --voice <id> --output hello.mp3
 ## 示例
 
 ```bash
+opencli fishaudio login                          # 打开登录页，等待完成登录
+opencli fishaudio login --timeout 180            # 延长等待时间（秒）
 opencli fishaudio auth-check
 opencli fishaudio voices --language zh --limit 10
 opencli fishaudio my-voices
