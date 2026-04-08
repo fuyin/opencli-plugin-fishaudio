@@ -168,15 +168,7 @@ function formatFishApiError(body, status) {
   if (keys.length) return `API \u9519\u8BEF ${status}: ${JSON.stringify(body)}`;
   return `API \u9519\u8BEF ${status}`;
 }
-async function apiCreateModel(token, title, audioFiles, opts) {
-  const formData = new FormData();
-  formData.append("title", title);
-  if (opts.description) formData.append("description", opts.description);
-  formData.append("enhance_audio_quality", String(opts.enhance !== false));
-  const lang = (opts.language || "zh").trim();
-  for (const l of lang.split(",").map((s) => s.trim()).filter(Boolean)) {
-    formData.append("languages", l);
-  }
+async function apiCreateModel(page, token, title, audioFiles, opts) {
   const MIME = {
     wav: "audio/wav",
     mp3: "audio/mpeg",
@@ -185,39 +177,77 @@ async function apiCreateModel(token, title, audioFiles, opts) {
     flac: "audio/flac",
     webm: "audio/webm"
   };
-  for (const file of audioFiles) {
+  const filesPayload = audioFiles.map((file) => {
     if (!existsSync(file.path)) {
       fail(`\u97F3\u9891\u6587\u4EF6\u4E0D\u5B58\u5728: ${file.path}`, "\u8BF7\u68C0\u67E5\u6587\u4EF6\u8DEF\u5F84\u662F\u5426\u6B63\u786E");
     }
     const buf = readFileSync(file.path);
     const fname = basename(file.path);
     const ext = extname(fname).slice(1).toLowerCase();
-    const mimeType = MIME[ext] ?? "audio/mpeg";
-    formData.append("voices", new Blob([buf], { type: mimeType }), fname);
-    if (file.text) formData.append("voices_texts", file.text);
-  }
-  let response;
-  try {
-    response = await fetch(`${API_DOMAIN}/model`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData
-    });
-  } catch (e) {
-    const err = e instanceof Error ? e : new Error(String(e));
-    const inner = err.cause instanceof Error ? err.cause.message : "";
-    fail(
-      `\u4E0A\u4F20\u8BF7\u6C42\u5931\u8D25: ${err.message}${inner ? ` \u2014 ${inner}` : ""}`,
-      "\u8BF7\u68C0\u67E5\u672C\u673A\u7F51\u7EDC\u3001VPN/\u4EE3\u7406\u3001\u9632\u706B\u5899\u662F\u5426\u62E6\u622A\u5BF9 api.fish.audio \u7684 HTTPS \u8BBF\u95EE"
-    );
-  }
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const msg = formatFishApiError(body, response.status);
-    const hint = response.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : response.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : response.status === 422 ? "\u8BF7\u68C0\u67E5\u97F3\u9891\u65F6\u957F\uFF08\u5EFA\u8BAE 15\u2013300 \u79D2\uFF09\u3001\u683C\u5F0F\u4E0E\u53EF\u9009\u8F6C\u5F55\u662F\u5426\u5339\u914D" : void 0;
+    return {
+      base64: buf.toString("base64"),
+      mime: MIME[ext] ?? "audio/mpeg",
+      filename: fname,
+      text: file.text ?? ""
+    };
+  });
+  const langs = (opts.language || "zh").split(",").map((s) => s.trim()).filter(Boolean);
+  const payload = JSON.stringify({
+    token,
+    title,
+    description: opts.description ?? "",
+    enhance: opts.enhance !== false,
+    languages: langs,
+    files: filesPayload,
+    type: opts.type ?? "tts",
+    trainMode: opts.trainMode ?? "fast",
+    visibility: opts.visibility ?? "private"
+  });
+  await ensureOnApiDomain(page);
+  const result = await page.evaluate(`(async () => {
+    try {
+      if (!location.origin.includes('api.fish.audio')) {
+        return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
+      }
+      const p = ${payload};
+      const fd = new FormData();
+      fd.append('title', p.title);
+      if (p.description) fd.append('description', p.description);
+      fd.append('enhance_audio_quality', String(p.enhance));
+      fd.append('type', p.type);
+      fd.append('train_mode', p.trainMode);
+      fd.append('visibility', p.visibility);
+      for (const l of p.languages) fd.append('languages', l);
+
+      for (const f of p.files) {
+        // atob \u2192 Uint8Array \u2192 Blob\uFF08\u5206\u5757\u8F6C\u6362\uFF0C\u907F\u514D\u5927\u6587\u4EF6\u6808\u6EA2\u51FA\uFF09
+        const bin = atob(f.base64);
+        const u8  = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        fd.append('voices', new Blob([u8], { type: f.mime }), f.filename);
+        if (f.text) fd.append('voices_texts', f.text);
+      }
+
+      const res = await fetch('/model', {
+        method:  'POST',
+        headers: { Authorization: 'Bearer ' + p.token },
+        body:    fd,
+      });
+      const body = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, body };
+    } catch (e) {
+      return { ok: false, status: 0, message: String(e) };
+    }
+  })()`);
+  const r = result;
+  if (!r.ok) {
+    if (r.message && !r.body) fail(r.message);
+    const body = r.body ?? {};
+    const msg = formatFishApiError(body, r.status);
+    const hint = r.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : r.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : r.status === 422 ? "\u8BF7\u68C0\u67E5\u97F3\u9891\u65F6\u957F\uFF08\u5EFA\u8BAE 15\u2013300 \u79D2\uFF09\u53CA\u683C\u5F0F\u662F\u5426\u6B63\u786E" : void 0;
     fail(msg, hint);
   }
-  return body;
+  return r.body ?? {};
 }
 cli({
   site: "fishaudio",
@@ -264,6 +294,19 @@ cli({
       type: "bool",
       default: true,
       help: "\u662F\u5426\u589E\u5F3A\u97F3\u9891\u8D28\u91CF\uFF08\u9ED8\u8BA4: true\uFF09"
+    },
+    {
+      name: "type",
+      type: "str",
+      default: "tts",
+      help: "\u58F0\u97F3\u6A21\u578B\u7C7B\u578B\uFF08\u9ED8\u8BA4: tts\uFF09"
+    },
+    {
+      name: "train_mode",
+      type: "str",
+      default: "fast",
+      choices: ["fast", "normal", "accurate"],
+      help: "\u8BAD\u7EC3\u6A21\u5F0F: fast | normal | accurate\uFF08\u9ED8\u8BA4: fast\uFF09"
     }
   ],
   columns: ["id", "name", "state", "languages"],
@@ -276,10 +319,12 @@ cli({
       path: p,
       text: kwargs.text || void 0
     }));
-    const result = await apiCreateModel(token, kwargs.name, audioFiles, {
+    const result = await apiCreateModel(page, token, kwargs.name, audioFiles, {
       language: kwargs.language || "zh",
       description: kwargs.description || "",
-      enhance: kwargs.enhance !== false
+      enhance: kwargs.enhance !== false,
+      type: kwargs.type || "tts",
+      trainMode: kwargs.train_mode || "fast"
     });
     return [{
       id: result._id ?? result.id ?? "\u2014",

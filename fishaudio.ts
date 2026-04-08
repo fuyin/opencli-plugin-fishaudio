@@ -245,34 +245,31 @@ function formatFishApiError(body: Record<string, unknown>, status: number): stri
 }
 
 /**
- * 声音克隆：用 Node.js 原生 fetch 向 api.fish.audio 发送 multipart/form-data，
- * 直接携带 Bearer token，无需在浏览器内执行（规避 CORS 限制同时支持大文件上传）。
+ * 声音克隆：通过浏览器执行 multipart/form-data 上传（与 apiTtsPost 同模式）。
+ *
+ * 原因：Node.js 原生 fetch 在企业网/代理环境下对 api.fish.audio 会出现
+ * TLS ECONNRESET；Chrome 网络栈自带代理配置，不受该限制。
+ *
+ * 实现思路：
+ *   1. Node.js 读取音频文件 → Buffer → base64 字符串
+ *   2. 将 base64 + 元数据序列化后传入 page.evaluate 字符串
+ *   3. 浏览器端：atob 还原 Uint8Array → Blob → FormData → POST /model
  *
  * Fish Audio Model Create API：POST /model
  *   - title          声音名称（必填）
  *   - description    描述（可选）
- *   - enhance_audio_quality  是否增强音质（默认 true）
- *   - languages      语言代码（可重复，如 "zh" "en"）
- *   - voices         音频二进制（可多个，字段名重复）
- *   - voices_texts   对应的文字转录（可选，与 voices 等长）
+ *   - enhance_audio_quality  是否增强音质
+ *   - languages      语言代码（可重复）
+ *   - voices         音频 Blob（可多个）
+ *   - voices_texts   对应转录（可选）
  */
 async function apiCreateModel(
+  page: IPage,
   token: string,
   title: string,
   audioFiles: { path: string; text?: string }[],
-  opts: { language?: string; description?: string; enhance?: boolean },
+  opts: { language?: string; description?: string; enhance?: boolean; type?: string; trainMode?: string; visibility?: string },
 ): Promise<Record<string, unknown>> {
-  const formData = new FormData();
-  formData.append('title', title);
-  if (opts.description) formData.append('description', opts.description);
-  formData.append('enhance_audio_quality', String(opts.enhance !== false));
-
-  const lang = (opts.language || 'zh').trim();
-  // 支持用逗号传多语言，如 "zh,en"
-  for (const l of lang.split(',').map(s => s.trim()).filter(Boolean)) {
-    formData.append('languages', l);
-  }
-
   const MIME: Record<string, string> = {
     wav:  'audio/wav',
     mp3:  'audio/mpeg',
@@ -282,46 +279,90 @@ async function apiCreateModel(
     webm: 'audio/webm',
   };
 
-  for (const file of audioFiles) {
+  // Node.js 侧：读文件 → base64，准备传入浏览器的纯 JSON 序列化载荷
+  const filesPayload = audioFiles.map(file => {
     if (!existsSync(file.path)) {
       fail(`音频文件不存在: ${file.path}`, '请检查文件路径是否正确');
     }
-    const buf      = readFileSync(file.path);
-    const fname    = basename(file.path);
-    const ext      = extname(fname).slice(1).toLowerCase();
-    const mimeType = MIME[ext] ?? 'audio/mpeg';
+    const buf   = readFileSync(file.path);
+    const fname = basename(file.path);
+    const ext   = extname(fname).slice(1).toLowerCase();
+    return {
+      base64:   buf.toString('base64'),
+      mime:     MIME[ext] ?? 'audio/mpeg',
+      filename: fname,
+      text:     file.text ?? '',
+    };
+  });
 
-    formData.append('voices', new Blob([buf], { type: mimeType }), fname);
-    if (file.text) formData.append('voices_texts', file.text);
-  }
+  const langs = (opts.language || 'zh')
+    .split(',').map(s => s.trim()).filter(Boolean);
 
-  let response: Response;
-  try {
-    response = await fetch(`${API_DOMAIN}/model`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body:    formData,
-    });
-  } catch (e: unknown) {
-    const err   = e instanceof Error ? e : new Error(String(e));
-    const inner = err.cause instanceof Error ? err.cause.message : '';
-    fail(
-      `上传请求失败: ${err.message}${inner ? ` — ${inner}` : ''}`,
-      '请检查本机网络、VPN/代理、防火墙是否拦截对 api.fish.audio 的 HTTPS 访问',
-    );
-  }
+  // 所有参数序列化为 JSON 字面量嵌入 evaluate 字符串，避免注入
+  const payload = JSON.stringify({
+    token,
+    title,
+    description:  opts.description ?? '',
+    enhance:      opts.enhance !== false,
+    languages:    langs,
+    files:        filesPayload,
+    type:         opts.type      ?? 'tts',
+    trainMode:    opts.trainMode ?? 'fast',
+    visibility:   opts.visibility ?? 'private',
+  });
 
-  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-  if (!response.ok) {
-    const msg = formatFishApiError(body, response.status);
+  await ensureOnApiDomain(page);
+
+  const result = await page.evaluate(`(async () => {
+    try {
+      if (!location.origin.includes('api.fish.audio')) {
+        return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
+      }
+      const p = ${payload};
+      const fd = new FormData();
+      fd.append('title', p.title);
+      if (p.description) fd.append('description', p.description);
+      fd.append('enhance_audio_quality', String(p.enhance));
+      fd.append('type', p.type);
+      fd.append('train_mode', p.trainMode);
+      fd.append('visibility', p.visibility);
+      for (const l of p.languages) fd.append('languages', l);
+
+      for (const f of p.files) {
+        // atob → Uint8Array → Blob（分块转换，避免大文件栈溢出）
+        const bin = atob(f.base64);
+        const u8  = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        fd.append('voices', new Blob([u8], { type: f.mime }), f.filename);
+        if (f.text) fd.append('voices_texts', f.text);
+      }
+
+      const res = await fetch('/model', {
+        method:  'POST',
+        headers: { Authorization: 'Bearer ' + p.token },
+        body:    fd,
+      });
+      const body = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, body };
+    } catch (e) {
+      return { ok: false, status: 0, message: String(e) };
+    }
+  })()`);
+
+  const r = result as { ok: boolean; status: number; body?: Record<string, unknown>; message?: string };
+
+  if (!r.ok) {
+    if (r.message && !r.body) fail(r.message);
+    const body = r.body ?? {};
+    const msg  = formatFishApiError(body, r.status);
     const hint =
-      response.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' :
-      response.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
-      response.status === 422 ? '请检查音频时长（建议 15–300 秒）、格式与可选转录是否匹配' :
+      r.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' :
+      r.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
+      r.status === 422 ? '请检查音频时长（建议 15–300 秒）及格式是否正确' :
       undefined;
     fail(msg, hint);
   }
-  return body;
+  return r.body ?? {};
 }
 
 cli({
@@ -370,6 +411,19 @@ cli({
       default: true,
       help:    '是否增强音频质量（默认: true）',
     },
+    {
+      name:    'type',
+      type:    'str',
+      default: 'tts',
+      help:    '声音模型类型（默认: tts）',
+    },
+    {
+      name:    'train_mode',
+      type:    'str',
+      default: 'fast',
+      choices: ['fast', 'normal', 'accurate'],
+      help:    '训练模式: fast | normal | accurate（默认: fast）',
+    },
   ],
   columns: ['id', 'name', 'state', 'languages'],
   func: async (page, kwargs) => {
@@ -384,10 +438,12 @@ cli({
       text: (kwargs.text as string) || undefined,
     }));
 
-    const result = await apiCreateModel(token, kwargs.name as string, audioFiles, {
+    const result = await apiCreateModel(page, token, kwargs.name as string, audioFiles, {
       language:    (kwargs.language as string) || 'zh',
       description: (kwargs.description as string) || '',
       enhance:     kwargs.enhance !== false,
+      type:        (kwargs.type as string) || 'tts',
+      trainMode:   (kwargs.train_mode as string) || 'fast',
     });
 
     return [{
