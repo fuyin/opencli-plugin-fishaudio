@@ -734,10 +734,37 @@ const EXTRACT_TOKEN_JS = `(async () => {
   return found;
 })()`;
 
+/**
+ * 尝试点击登录页的提交按钮（浏览器已记住账号密码，表单自动填充后直接提交）。
+ * 返回是否成功找到并点击了按钮。
+ *
+ * 按钮选择器优先级：
+ *   1. type="submit" 按钮
+ *   2. 包含"登录"/"Sign in"/"Log in"/"Continue"文字的按钮
+ *   3. form 内第一个 button
+ */
+const CLICK_SUBMIT_JS = `(() => {
+  // 优先找 type=submit
+  let btn = document.querySelector('button[type="submit"]');
+  if (!btn) {
+    // 按文字匹配
+    const keywords = ['登录', 'Sign in', 'Log in', 'Login', 'Continue', '继续'];
+    btn = Array.from(document.querySelectorAll('button')).find(b =>
+      keywords.some(k => b.textContent?.trim().includes(k))
+    ) || null;
+  }
+  if (!btn) {
+    // form 内第一个按钮
+    btn = document.querySelector('form button');
+  }
+  if (btn) { (btn as HTMLElement).click(); return true; }
+  return false;
+})()`;
+
 cli({
   site: 'fishaudio',
   name: 'login',
-  description: '在 Chrome 中打开 Fish Audio 登录页，完成登录后自动确认 token 已写入',
+  description: '打开 Fish Audio 登录页，自动点击登录按钮（浏览器已记住密码时一键完成）',
   domain: 'fish.audio',
   strategy: Strategy.COOKIE,
   browser: true,
@@ -746,8 +773,14 @@ cli({
     {
       name:    'timeout',
       type:    'int',
-      default: 120,
-      help:    '等待登录完成的最长秒数（默认 120 秒）',
+      default: 60,
+      help:    '等待登录完成的最长秒数（默认 60 秒）',
+    },
+    {
+      name:    'force',
+      type:    'bool',
+      default: false,
+      help:    '即使已登录也强制重新执行登录流程',
     },
   ],
   columns: ['status', 'token_prefix'],
@@ -756,44 +789,55 @@ cli({
 
     const LOGIN_URL = `${FISH_DOMAIN}/zh-CN/auth/?redirect=%2Fapp%2F`;
 
-    // 先检查是否已经登录，已登录则无需重复跳转
-    const currentUrl = await page.evaluate(`(() => location.href)()`) as string;
-    if (currentUrl?.includes('fish.audio') && !currentUrl.includes('api.fish.audio')) {
-      const pre = await page.evaluate(EXTRACT_TOKEN_JS) as { token: string | null };
-      if (pre.token) {
-        return [{
-          status:       '✅ 已登录（无需重新登录）',
-          token_prefix: pre.token.slice(0, 20) + '...',
-        }];
+    // 非强制模式下：已有 token 则直接返回
+    if (!(kwargs.force as boolean)) {
+      const currentUrl = await page.evaluate(`(() => location.href)()`) as string;
+      if (currentUrl?.includes('fish.audio') && !currentUrl.includes('api.fish.audio')) {
+        const pre = await page.evaluate(EXTRACT_TOKEN_JS) as { token: string | null };
+        if (pre.token) {
+          return [{
+            status:       '✅ 已登录（跳过，用 --force 可强制重新登录）',
+            token_prefix: pre.token.slice(0, 20) + '...',
+          }];
+        }
       }
     }
 
-    // 导航到登录页
-    await page.goto(LOGIN_URL, { waitUntil: 'none', settleMs: 0 });
+    // 导航到登录页，等待 DOM 渲染完成
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', settleMs: 500 });
 
-    // 轮询等待用户完成登录（每 2 秒检查一次 token）
-    const maxSeconds = Math.max(10, (kwargs.timeout as number) ?? 120);
-    const interval   = 2;
-    const maxTries   = Math.ceil(maxSeconds / interval);
+    // 等待浏览器自动填充密码（通常在 DOMContentLoaded 后 0.5-1 秒完成）
+    await page.wait(1.5);
 
+    // 尝试自动点击登录按钮
+    const clicked = await page.evaluate(CLICK_SUBMIT_JS) as boolean;
+
+    // 无论是否点击成功，轮询等待 token 出现（用户也可能手动点）
+    const maxSeconds = Math.max(10, (kwargs.timeout as number) ?? 60);
     let token: string | null = null;
-    for (let i = 0; i < maxTries; i++) {
-      await page.wait(interval);
 
-      // 页面可能在登录后跳转到 /app/，重新确认 token
+    for (let elapsed = 0; elapsed < maxSeconds; elapsed += 2) {
+      await page.wait(2);
       const r = await page.evaluate(EXTRACT_TOKEN_JS) as { token: string | null };
       if (r.token) { token = r.token; break; }
+
+      // 若首次未能点击（按钮还未渲染），每 4 秒重试一次点击
+      if (!token && elapsed % 4 === 2) {
+        await page.evaluate(CLICK_SUBMIT_JS);
+      }
     }
 
     if (!token) {
       fail(
-        `等待超时（${maxSeconds} 秒内未检测到登录 token）`,
-        '请确认已在浏览器窗口中完成账号密码或第三方登录，或用 --timeout 延长等待时间',
+        `登录超时（${maxSeconds} 秒内未检测到 token）`,
+        clicked
+          ? '按钮已点击但未跳转，请检查账号密码是否正确，或手动在浏览器窗口完成登录后重试'
+          : '未找到登录按钮，请手动在浏览器窗口点击登录，或用 --timeout 延长等待时间',
       );
     }
 
     return [{
-      status:       '✅ 登录成功',
+      status:       `✅ 登录成功${clicked ? '（自动点击）' : '（手动完成）'}`,
       token_prefix: token!.slice(0, 20) + '...',
     }];
   },
