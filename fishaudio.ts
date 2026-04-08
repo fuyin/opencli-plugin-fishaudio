@@ -757,7 +757,7 @@ const CLICK_SUBMIT_JS = `(() => {
     // form 内第一个按钮
     btn = document.querySelector('form button');
   }
-  if (btn) { (btn as HTMLElement).click(); return true; }
+  if (btn) { btn.click(); return true; }
   return false;
 })()`;
 

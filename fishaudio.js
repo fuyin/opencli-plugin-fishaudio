@@ -600,7 +600,7 @@ const CLICK_SUBMIT_JS = `(() => {
     // form \u5185\u7B2C\u4E00\u4E2A\u6309\u94AE
     btn = document.querySelector('form button');
   }
-  if (btn) { (btn as HTMLElement).click(); return true; }
+  if (btn) { btn.click(); return true; }
   return false;
 })()`;
 cli({
