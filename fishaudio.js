@@ -147,6 +147,27 @@ async function apiTtsPost(page, token, ttsModel, body) {
   if (!r.ok) fail(r.message || `TTS \u8BF7\u6C42\u5931\u8D25 (${r.status})`, r.hint);
   return { base64: r.base64, size: r.size };
 }
+function formatFishApiError(body, status) {
+  const m = body?.message;
+  if (typeof m === "string" && m.trim()) return m.trim();
+  const d = body?.detail;
+  if (typeof d === "string" && d.trim()) return d.trim();
+  if (Array.isArray(d)) {
+    const parts = d.map((item) => {
+      if (item && typeof item === "object" && "msg" in item) {
+        const o = item;
+        const where = Array.isArray(o.loc) ? o.loc.join(".") : "";
+        return [where, o.msg, o.type].filter(Boolean).join(": ");
+      }
+      return typeof item === "string" ? item : JSON.stringify(item);
+    });
+    return parts.length ? parts.join("\uFF1B") : `API \u9519\u8BEF ${status}`;
+  }
+  if (d && typeof d === "object") return JSON.stringify(d);
+  const keys = Object.keys(body);
+  if (keys.length) return `API \u9519\u8BEF ${status}: ${JSON.stringify(body)}`;
+  return `API \u9519\u8BEF ${status}`;
+}
 async function apiCreateModel(token, title, audioFiles, opts) {
   const formData = new FormData();
   formData.append("title", title);
@@ -175,15 +196,25 @@ async function apiCreateModel(token, title, audioFiles, opts) {
     formData.append("voices", new Blob([buf], { type: mimeType }), fname);
     if (file.text) formData.append("voices_texts", file.text);
   }
-  const response = await fetch(`${API_DOMAIN}/model`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: formData
-  });
+  let response;
+  try {
+    response = await fetch(`${API_DOMAIN}/model`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData
+    });
+  } catch (e) {
+    const err = e instanceof Error ? e : new Error(String(e));
+    const inner = err.cause instanceof Error ? err.cause.message : "";
+    fail(
+      `\u4E0A\u4F20\u8BF7\u6C42\u5931\u8D25: ${err.message}${inner ? ` \u2014 ${inner}` : ""}`,
+      "\u8BF7\u68C0\u67E5\u672C\u673A\u7F51\u7EDC\u3001VPN/\u4EE3\u7406\u3001\u9632\u706B\u5899\u662F\u5426\u62E6\u622A\u5BF9 api.fish.audio \u7684 HTTPS \u8BBF\u95EE"
+    );
+  }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const msg = body?.message || `API \u9519\u8BEF ${response.status}`;
-    const hint = response.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : response.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : void 0;
+    const msg = formatFishApiError(body, response.status);
+    const hint = response.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : response.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : response.status === 422 ? "\u8BF7\u68C0\u67E5\u97F3\u9891\u65F6\u957F\uFF08\u5EFA\u8BAE 15\u2013300 \u79D2\uFF09\u3001\u683C\u5F0F\u4E0E\u53EF\u9009\u8F6C\u5F55\u662F\u5426\u5339\u914D" : void 0;
     fail(msg, hint);
   }
   return body;

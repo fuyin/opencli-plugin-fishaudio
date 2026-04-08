@@ -219,6 +219,31 @@ async function apiTtsPost(
 }
 
 
+/** 将 Fish API 错误体整理为可读字符串（兼容 message / FastAPI detail 等） */
+function formatFishApiError(body: Record<string, unknown>, status: number): string {
+  const m = body?.message;
+  if (typeof m === 'string' && m.trim()) return m.trim();
+
+  const d = body?.detail;
+  if (typeof d === 'string' && d.trim()) return d.trim();
+  if (Array.isArray(d)) {
+    const parts = d.map((item: unknown) => {
+      if (item && typeof item === 'object' && 'msg' in (item as object)) {
+        const o = item as { loc?: unknown[]; msg?: string; type?: string };
+        const where = Array.isArray(o.loc) ? o.loc.join('.') : '';
+        return [where, o.msg, o.type].filter(Boolean).join(': ');
+      }
+      return typeof item === 'string' ? item : JSON.stringify(item);
+    });
+    return parts.length ? parts.join('；') : `API 错误 ${status}`;
+  }
+  if (d && typeof d === 'object') return JSON.stringify(d);
+
+  const keys = Object.keys(body);
+  if (keys.length) return `API 错误 ${status}: ${JSON.stringify(body)}`;
+  return `API 错误 ${status}`;
+}
+
 /**
  * 声音克隆：用 Node.js 原生 fetch 向 api.fish.audio 发送 multipart/form-data，
  * 直接携带 Bearer token，无需在浏览器内执行（规避 CORS 限制同时支持大文件上传）。
@@ -270,18 +295,29 @@ async function apiCreateModel(
     if (file.text) formData.append('voices_texts', file.text);
   }
 
-  const response = await fetch(`${API_DOMAIN}/model`, {
-    method:  'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body:    formData,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_DOMAIN}/model`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body:    formData,
+    });
+  } catch (e: unknown) {
+    const err   = e instanceof Error ? e : new Error(String(e));
+    const inner = err.cause instanceof Error ? err.cause.message : '';
+    fail(
+      `上传请求失败: ${err.message}${inner ? ` — ${inner}` : ''}`,
+      '请检查本机网络、VPN/代理、防火墙是否拦截对 api.fish.audio 的 HTTPS 访问',
+    );
+  }
 
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
   if (!response.ok) {
-    const msg  = (body?.message as string) || `API 错误 ${response.status}`;
+    const msg = formatFishApiError(body, response.status);
     const hint =
       response.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' :
       response.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
+      response.status === 422 ? '请检查音频时长（建议 15–300 秒）、格式与可选转录是否匹配' :
       undefined;
     fail(msg, hint);
   }
