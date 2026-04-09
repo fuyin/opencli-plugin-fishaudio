@@ -1,6 +1,6 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from "fs";
-import { dirname, basename, extname } from "path";
+import { dirname, basename, extname, resolve as resolvePath } from "path";
 const FISH_DOMAIN = "https://fish.audio";
 const API_DOMAIN = "https://api.fish.audio";
 function fail(message, hint) {
@@ -169,47 +169,26 @@ function formatFishApiError(body, status) {
   return `API \u9519\u8BEF ${status}`;
 }
 async function apiCreateModel(page, token, title, audioFiles, opts) {
-  const MIME = {
-    wav: "audio/wav",
-    mp3: "audio/mpeg",
-    m4a: "audio/mp4",
-    ogg: "audio/ogg",
-    flac: "audio/flac",
-    webm: "audio/webm"
-  };
-  const filesPayload = audioFiles.map((file) => {
+  for (const file of audioFiles) {
     if (!existsSync(file.path)) {
       fail(`\u97F3\u9891\u6587\u4EF6\u4E0D\u5B58\u5728: ${file.path}`, "\u8BF7\u68C0\u67E5\u6587\u4EF6\u8DEF\u5F84\u662F\u5426\u6B63\u786E");
     }
-    const buf = readFileSync(file.path);
-    const fname = basename(file.path);
-    const ext = extname(fname).slice(1).toLowerCase();
-    return {
-      base64: buf.toString("base64"),
-      mime: MIME[ext] ?? "audio/mpeg",
-      filename: fname,
-      text: file.text ?? ""
-    };
-  });
+  }
+  await ensureOnApiDomain(page);
   const langs = (opts.language || "zh").split(",").map((s) => s.trim()).filter(Boolean);
-  const payload = JSON.stringify({
+  const metaPayload = JSON.stringify({
     token,
     title,
     description: opts.description ?? "",
     enhance: opts.enhance !== false,
     languages: langs,
-    files: filesPayload,
+    filesTexts: audioFiles.map((f) => f.text ?? ""),
     type: opts.type ?? "tts",
     trainMode: opts.trainMode ?? "fast",
     visibility: opts.visibility ?? "private"
   });
-  await ensureOnApiDomain(page);
-  const result = await page.evaluate(`(async () => {
-    try {
-      if (!location.origin.includes('api.fish.audio')) {
-        return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
-      }
-      const p = ${payload};
+  const FETCH_BLOCK = `
+      const p = ${metaPayload};
       const fd = new FormData();
       fd.append('title', p.title);
       if (p.description) fd.append('description', p.description);
@@ -217,21 +196,133 @@ async function apiCreateModel(page, token, title, audioFiles, opts) {
       fd.append('type', p.type);
       fd.append('train_mode', p.trainMode);
       fd.append('visibility', p.visibility);
-      for (const l of p.languages) fd.append('languages', l);
-
-      for (const f of p.files) {
-        // atob \u2192 Uint8Array \u2192 Blob\uFF08\u5206\u5757\u8F6C\u6362\uFF0C\u907F\u514D\u5927\u6587\u4EF6\u6808\u6EA2\u51FA\uFF09
-        const bin = atob(f.base64);
-        const u8  = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        fd.append('voices', new Blob([u8], { type: f.mime }), f.filename);
-        if (f.text) fd.append('voices_texts', f.text);
+      for (const l of p.languages) fd.append('languages', l);`;
+  let result;
+  if (page.setFileInput) {
+    await page.evaluate(`(() => {
+      let inp = document.getElementById('_oc_voice_input');
+      if (!inp) {
+        inp = document.createElement('input');
+        inp.type = 'file'; inp.multiple = true; inp.id = '_oc_voice_input';
+        inp.style.display = 'none';
+        (document.body || document.documentElement).appendChild(inp);
       }
-
-      const res = await fetch('/model', {
-        method:  'POST',
-        headers: { Authorization: 'Bearer ' + p.token },
-        body:    fd,
+    })()`);
+    const absPaths = audioFiles.map((f) => resolvePath(f.path));
+    await page.setFileInput(absPaths, "#_oc_voice_input");
+    result = await page.evaluate(`(async () => {
+      try {
+        if (!location.origin.includes('api.fish.audio')) {
+          return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
+        }
+        const inp = document.getElementById('_oc_voice_input');
+        if (!inp || !inp.files || inp.files.length === 0) {
+          return { ok: false, status: 0, message: 'setFileInput \u672A\u9644\u52A0\u6587\u4EF6\uFF08\u6269\u5C55\u7248\u672C\u53EF\u80FD\u4E0D\u652F\u6301\u8BE5\u547D\u4EE4\uFF09' };
+        }
+        ${FETCH_BLOCK}
+        for (let i = 0; i < inp.files.length; i++) {
+          fd.append('voices', inp.files[i]);
+          if (p.filesTexts[i]) fd.append('voices_texts', p.filesTexts[i]);
+        }
+        const res = await fetch('/model', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + p.token }, body: fd,
+        });
+        const body = await res.json().catch(() => ({}));
+        return { ok: res.ok, status: res.status, body };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e) };
+      }
+    })()`);
+    await page.evaluate(`(() => { const el = document.getElementById('_oc_voice_input'); if (el) el.remove(); })()`).catch(() => {
+    });
+  } else {
+    const MIME = {
+      wav: "audio/wav",
+      mp3: "audio/mpeg",
+      m4a: "audio/mp4",
+      ogg: "audio/ogg",
+      flac: "audio/flac",
+      webm: "audio/webm"
+    };
+    const filesPayload = audioFiles.map((file) => {
+      const buf = readFileSync(file.path);
+      const fname = basename(file.path);
+      const ext = extname(fname).slice(1).toLowerCase();
+      return { base64: buf.toString("base64"), mime: MIME[ext] ?? "audio/mpeg", filename: fname, text: file.text ?? "" };
+    });
+    const totalB64KB = Math.round(filesPayload.reduce((s, f) => s + f.base64.length, 0) / 1024);
+    if (totalB64KB > 700) {
+      fail(
+        `\u97F3\u9891\u6587\u4EF6\u8FC7\u5927\uFF08base64 \u7EA6 ${totalB64KB} KB\uFF09\uFF0C\u8D85\u51FA daemon 1 MB \u4F20\u8F93\u9650\u5236`,
+        "\u8BF7\u66F4\u65B0 OpenCLI Browser Bridge \u6269\u5C55\uFF08\u65B0\u7248\u672C\u652F\u6301 setFileInput \u5927\u6587\u4EF6\u4E0A\u4F20\uFF09\uFF0C\u6216\u4F7F\u7528\u8F83\u5C0F\u7684\u97F3\u9891\u6587\u4EF6\uFF08< 500 KB\uFF09"
+      );
+    }
+    const payload = JSON.stringify({
+      token,
+      title,
+      description: opts.description ?? "",
+      enhance: opts.enhance !== false,
+      languages: langs,
+      files: filesPayload,
+      type: opts.type ?? "tts",
+      trainMode: opts.trainMode ?? "fast",
+      visibility: opts.visibility ?? "private"
+    });
+    result = await page.evaluate(`(async () => {
+      try {
+        if (!location.origin.includes('api.fish.audio')) {
+          return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
+        }
+        ${FETCH_BLOCK.replace("${metaPayload}", "").replace(metaPayload, "")}
+        const p2 = ${payload};
+        const fd2 = new FormData();
+        fd2.append('title', p2.title);
+        if (p2.description) fd2.append('description', p2.description);
+        fd2.append('enhance_audio_quality', String(p2.enhance));
+        fd2.append('type', p2.type);
+        fd2.append('train_mode', p2.trainMode);
+        fd2.append('visibility', p2.visibility);
+        for (const l of p2.languages) fd2.append('languages', l);
+        for (const f of p2.files) {
+          const bin = atob(f.base64);
+          const u8  = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+          fd2.append('voices', new Blob([u8], { type: f.mime }), f.filename);
+          if (f.text) fd2.append('voices_texts', f.text);
+        }
+        const res = await fetch('/model', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + p2.token }, body: fd2,
+        });
+        const body = await res.json().catch(() => ({}));
+        return { ok: res.ok, status: res.status, body };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e) };
+      }
+    })()`);
+  }
+  const r = result;
+  if (!r.ok) {
+    if (r.message && !r.body) fail(r.message);
+    const body = r.body ?? {};
+    const msg = formatFishApiError(body, r.status);
+    const hint = r.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : r.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : r.status === 422 ? "\u8BF7\u68C0\u67E5\u97F3\u9891\u65F6\u957F\uFF08\u5EFA\u8BAE 15\u2013300 \u79D2\uFF09\u53CA\u683C\u5F0F\u662F\u5426\u6B63\u786E" : void 0;
+    fail(msg, hint);
+  }
+  return r.body ?? {};
+}
+async function apiDeleteModel(page, token, modelId) {
+  await ensureOnApiDomain(page);
+  const safeId = String(modelId || "").trim();
+  if (!safeId) fail("\u7F3A\u5C11 model id");
+  const result = await page.evaluate(`(async () => {
+    try {
+      if (!location.origin.includes('api.fish.audio')) {
+        return { ok: false, status: 0, message: '\u5BFC\u822A\u81F3 api.fish.audio \u5931\u8D25\uFF08\u5F53\u524D\u5728 ' + location.origin + '\uFF09' };
+      }
+      const id = ${JSON.stringify(safeId)};
+      const res = await fetch('/model/' + encodeURIComponent(id), {
+        method:  'DELETE',
+        headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} },
       });
       const body = await res.json().catch(() => ({}));
       return { ok: res.ok, status: res.status, body };
@@ -244,7 +335,7 @@ async function apiCreateModel(page, token, title, audioFiles, opts) {
     if (r.message && !r.body) fail(r.message);
     const body = r.body ?? {};
     const msg = formatFishApiError(body, r.status);
-    const hint = r.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : r.status === 402 ? "\u8D26\u53F7\u989D\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u524D\u5F80 https://fish.audio/go-api/ \u5145\u503C" : r.status === 422 ? "\u8BF7\u68C0\u67E5\u97F3\u9891\u65F6\u957F\uFF08\u5EFA\u8BAE 15\u2013300 \u79D2\uFF09\u53CA\u683C\u5F0F\u662F\u5426\u6B63\u786E" : void 0;
+    const hint = r.status === 401 ? "\u767B\u5F55\u6001\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728 Chrome \u4E2D\u91CD\u65B0\u767B\u5F55 fish.audio" : r.status === 403 ? "\u6743\u9650\u4E0D\u8DB3\uFF08\u53EA\u80FD\u5220\u9664\u81EA\u5DF1\u7684\u58F0\u97F3\u6A21\u578B\uFF09" : r.status === 404 ? "\u672A\u627E\u5230\u8BE5\u58F0\u97F3\u6A21\u578B\uFF08\u53EF\u80FD\u5DF2\u88AB\u5220\u9664\uFF0C\u6216 id \u4E0D\u6B63\u786E\uFF09" : void 0;
     fail(msg, hint);
   }
   return r.body ?? {};
@@ -331,6 +422,49 @@ cli({
       name: result.title ?? kwargs.name,
       state: result.state ?? "processing",
       languages: (result.languages || []).join(", ") || kwargs.language || "zh"
+    }];
+  }
+});
+cli({
+  site: "fishaudio",
+  name: "delete",
+  description: "\u5220\u9664\u6211\u7684\u58F0\u97F3\u6A21\u578B\uFF08\u514B\u9686/\u4E0A\u4F20\uFF09\u3002\u5371\u9669\u64CD\u4F5C\uFF0C\u9ED8\u8BA4\u9700\u8981 --yes \u786E\u8BA4",
+  domain: "fish.audio",
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    {
+      name: "id",
+      type: "str",
+      required: true,
+      positional: true,
+      help: "\u58F0\u97F3\u6A21\u578B ID\uFF08\u53EF\u7528 opencli fishaudio my-voices \u67E5\u770B\uFF09"
+    },
+    {
+      name: "yes",
+      type: "bool",
+      default: false,
+      help: "\u786E\u8BA4\u5220\u9664\uFF08\u5FC5\u987B\u663E\u5F0F\u4F20\u5165 --yes \u624D\u4F1A\u6267\u884C\uFF09"
+    }
+  ],
+  columns: ["id", "deleted", "message"],
+  func: async (page, kwargs) => {
+    if (!page) fail("\u9700\u8981\u6D4F\u89C8\u5668\u8FDE\u63A5");
+    const id = String(kwargs.id || "").trim();
+    if (!id) fail("\u7F3A\u5C11\u58F0\u97F3\u6A21\u578B ID");
+    if (!kwargs.yes) {
+      fail(
+        "\u8FD9\u662F\u5371\u9669\u64CD\u4F5C\uFF1A\u5C06\u6C38\u4E45\u5220\u9664\u8BE5\u58F0\u97F3\u6A21\u578B",
+        `\u5982\u679C\u786E\u8BA4\u5220\u9664\uFF0C\u8BF7\u6267\u884C\uFF1Aopencli fishaudio delete ${id} --yes`
+      );
+    }
+    const token = await getToken(page);
+    const body = await apiDeleteModel(page, token, id);
+    return [{
+      id,
+      deleted: true,
+      message: body?.message || "ok"
     }];
   }
 });
@@ -717,7 +851,7 @@ cli({
         }
       }
     }
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", settleMs: 500 });
+    await page.goto(LOGIN_URL, { waitUntil: "load", settleMs: 500 });
     await page.wait(1.5);
     const clicked = await page.evaluate(CLICK_SUBMIT_JS);
     const maxSeconds = Math.max(10, kwargs.timeout ?? 60);

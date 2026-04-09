@@ -21,7 +21,7 @@
 
 import { cli, Strategy, type IPage } from '@jackwener/opencli/registry';
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
-import { dirname, basename, extname } from 'path';
+import { dirname, basename, extname, resolve as resolvePath } from 'path';
 
 const FISH_DOMAIN   = 'https://fish.audio';
 const API_DOMAIN    = 'https://api.fish.audio';
@@ -245,23 +245,24 @@ function formatFishApiError(body: Record<string, unknown>, status: number): stri
 }
 
 /**
- * 声音克隆：通过浏览器执行 multipart/form-data 上传（与 apiTtsPost 同模式）。
+ * 声音克隆：上传音频文件创建自定义声音模型。
  *
- * 原因：Node.js 原生 fetch 在企业网/代理环境下对 api.fish.audio 会出现
- * TLS ECONNRESET；Chrome 网络栈自带代理配置，不受该限制。
+ * 网络架构说明：
+ *   page.evaluate 的 JS 代码字符串通过 JSON body 发送到本地 daemon（POST http://127.0.0.1:port/command）。
+ *   daemon 硬性限制 body ≤ 1 MB（防 OOM）。若把音频 base64 内嵌在 evaluate 字符串里，
+ *   文件 > ~750 KB 时 daemon 会调用 req.destroy()，Node.js undici 捕获到 ECONNRESET 报 "fetch failed"。
  *
- * 实现思路：
- *   1. Node.js 读取音频文件 → Buffer → base64 字符串
- *   2. 将 base64 + 元数据序列化后传入 page.evaluate 字符串
- *   3. 浏览器端：atob 还原 Uint8Array → Blob → FormData → POST /model
+ * 修复方案（优先）：page.setFileInput
+ *   IPage.setFileInput 通过 CDP DOM.setFileInputFiles 让 Chrome 直接从磁盘读取文件，
+ *   完全绕开 daemon 的 1 MB body 限制，适用于任意大小的音频文件。
  *
- * Fish Audio Model Create API：POST /model
- *   - title          声音名称（必填）
- *   - description    描述（可选）
- *   - enhance_audio_quality  是否增强音质
- *   - languages      语言代码（可重复）
- *   - voices         音频 Blob（可多个）
- *   - voices_texts   对应转录（可选）
+ * 备用方案：base64-in-evaluate（仅小文件 < 700 KB）
+ *   当 setFileInput 不可用（旧版扩展）且文件足够小时使用原始方案，
+ *   超过限制时提前报错并提示用户更新扩展。
+ *
+ * Fish Audio Model Create API：POST /model（multipart/form-data）
+ *   - title / description / enhance_audio_quality / type / train_mode / visibility / languages
+ *   - voices（音频文件，可多个）/ voices_texts（对应转录，可选）
  */
 async function apiCreateModel(
   page: IPage,
@@ -270,55 +271,34 @@ async function apiCreateModel(
   audioFiles: { path: string; text?: string }[],
   opts: { language?: string; description?: string; enhance?: boolean; type?: string; trainMode?: string; visibility?: string },
 ): Promise<Record<string, unknown>> {
-  const MIME: Record<string, string> = {
-    wav:  'audio/wav',
-    mp3:  'audio/mpeg',
-    m4a:  'audio/mp4',
-    ogg:  'audio/ogg',
-    flac: 'audio/flac',
-    webm: 'audio/webm',
-  };
 
-  // Node.js 侧：读文件 → base64，准备传入浏览器的纯 JSON 序列化载荷
-  const filesPayload = audioFiles.map(file => {
+  // Node.js 侧：仅验证文件存在，不读取内容（由后续步骤决定读取方式）
+  for (const file of audioFiles) {
     if (!existsSync(file.path)) {
       fail(`音频文件不存在: ${file.path}`, '请检查文件路径是否正确');
     }
-    const buf   = readFileSync(file.path);
-    const fname = basename(file.path);
-    const ext   = extname(fname).slice(1).toLowerCase();
-    return {
-      base64:   buf.toString('base64'),
-      mime:     MIME[ext] ?? 'audio/mpeg',
-      filename: fname,
-      text:     file.text ?? '',
-    };
-  });
+  }
 
-  const langs = (opts.language || 'zh')
-    .split(',').map(s => s.trim()).filter(Boolean);
+  await ensureOnApiDomain(page);
 
-  // 所有参数序列化为 JSON 字面量嵌入 evaluate 字符串，避免注入
-  const payload = JSON.stringify({
+  const langs = (opts.language || 'zh').split(',').map(s => s.trim()).filter(Boolean);
+
+  // 元数据 payload（仅字符串/数字，不含文件数据，远小于 1 MB 限制）
+  const metaPayload = JSON.stringify({
     token,
     title,
     description:  opts.description ?? '',
     enhance:      opts.enhance !== false,
     languages:    langs,
-    files:        filesPayload,
+    filesTexts:   audioFiles.map(f => f.text ?? ''),
     type:         opts.type      ?? 'tts',
     trainMode:    opts.trainMode ?? 'fast',
     visibility:   opts.visibility ?? 'private',
   });
 
-  await ensureOnApiDomain(page);
-
-  const result = await page.evaluate(`(async () => {
-    try {
-      if (!location.origin.includes('api.fish.audio')) {
-        return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
-      }
-      const p = ${payload};
+  // evaluate 内部的公共 FormData POST 模板（复用于两条路径）
+  const FETCH_BLOCK = `
+      const p = ${metaPayload};
       const fd = new FormData();
       fd.append('title', p.title);
       if (p.description) fd.append('description', p.description);
@@ -326,28 +306,120 @@ async function apiCreateModel(
       fd.append('type', p.type);
       fd.append('train_mode', p.trainMode);
       fd.append('visibility', p.visibility);
-      for (const l of p.languages) fd.append('languages', l);
+      for (const l of p.languages) fd.append('languages', l);`;
 
-      for (const f of p.files) {
-        // atob → Uint8Array → Blob（分块转换，避免大文件栈溢出）
-        const bin = atob(f.base64);
-        const u8  = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        fd.append('voices', new Blob([u8], { type: f.mime }), f.filename);
-        if (f.text) fd.append('voices_texts', f.text);
+  let result: unknown;
+
+  if (page.setFileInput) {
+    // ── 路径 A：setFileInput（推荐，无大小限制）──────────────────────────────
+    // 1. 在 api.fish.audio 页面动态注入隐藏 file input
+    await page.evaluate(`(() => {
+      let inp = document.getElementById('_oc_voice_input');
+      if (!inp) {
+        inp = document.createElement('input');
+        inp.type = 'file'; inp.multiple = true; inp.id = '_oc_voice_input';
+        inp.style.display = 'none';
+        (document.body || document.documentElement).appendChild(inp);
       }
+    })()`);
 
-      const res = await fetch('/model', {
-        method:  'POST',
-        headers: { Authorization: 'Bearer ' + p.token },
-        body:    fd,
-      });
-      const body = await res.json().catch(() => ({}));
-      return { ok: res.ok, status: res.status, body };
-    } catch (e) {
-      return { ok: false, status: 0, message: String(e) };
+    // 2. 通过 CDP DOM.setFileInputFiles 让 Chrome 直接读本地文件（绕开 daemon 1 MB 限制）
+    const absPaths = audioFiles.map(f => resolvePath(f.path));
+    await page.setFileInput(absPaths, '#_oc_voice_input');
+
+    // 3. 从 input.files 构建 FormData，在 api.fish.audio 同源发 POST
+    result = await page.evaluate(`(async () => {
+      try {
+        if (!location.origin.includes('api.fish.audio')) {
+          return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
+        }
+        const inp = document.getElementById('_oc_voice_input');
+        if (!inp || !inp.files || inp.files.length === 0) {
+          return { ok: false, status: 0, message: 'setFileInput 未附加文件（扩展版本可能不支持该命令）' };
+        }
+        ${FETCH_BLOCK}
+        for (let i = 0; i < inp.files.length; i++) {
+          fd.append('voices', inp.files[i]);
+          if (p.filesTexts[i]) fd.append('voices_texts', p.filesTexts[i]);
+        }
+        const res = await fetch('/model', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + p.token }, body: fd,
+        });
+        const body = await res.json().catch(() => ({}));
+        return { ok: res.ok, status: res.status, body };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e) };
+      }
+    })()`);
+
+    // 清理 input 元素（非关键，忽略失败）
+    await page.evaluate(`(() => { const el = document.getElementById('_oc_voice_input'); if (el) el.remove(); })()`).catch(() => {});
+
+  } else {
+    // ── 路径 B：base64-in-evaluate（旧版扩展降级，仅支持小文件）──────────────
+    const MIME: Record<string, string> = {
+      wav: 'audio/wav', mp3: 'audio/mpeg', m4a: 'audio/mp4',
+      ogg: 'audio/ogg', flac: 'audio/flac', webm: 'audio/webm',
+    };
+    const filesPayload = audioFiles.map(file => {
+      const buf   = readFileSync(file.path);
+      const fname = basename(file.path);
+      const ext   = extname(fname).slice(1).toLowerCase();
+      return { base64: buf.toString('base64'), mime: MIME[ext] ?? 'audio/mpeg', filename: fname, text: file.text ?? '' };
+    });
+
+    // 预检大小：base64 + 模板代码 > 700 KB 时，daemon 的 1 MB 限制必然触发
+    const totalB64KB = Math.round(filesPayload.reduce((s, f) => s + f.base64.length, 0) / 1024);
+    if (totalB64KB > 700) {
+      fail(
+        `音频文件过大（base64 约 ${totalB64KB} KB），超出 daemon 1 MB 传输限制`,
+        '请更新 OpenCLI Browser Bridge 扩展（新版本支持 setFileInput 大文件上传），或使用较小的音频文件（< 500 KB）',
+      );
     }
-  })()`);
+
+    const payload = JSON.stringify({
+      token, title,
+      description:  opts.description ?? '',
+      enhance:      opts.enhance !== false,
+      languages:    langs,
+      files:        filesPayload,
+      type:         opts.type      ?? 'tts',
+      trainMode:    opts.trainMode ?? 'fast',
+      visibility:   opts.visibility ?? 'private',
+    });
+
+    result = await page.evaluate(`(async () => {
+      try {
+        if (!location.origin.includes('api.fish.audio')) {
+          return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
+        }
+        ${FETCH_BLOCK.replace('${metaPayload}', '').replace(metaPayload, '')}
+        const p2 = ${payload};
+        const fd2 = new FormData();
+        fd2.append('title', p2.title);
+        if (p2.description) fd2.append('description', p2.description);
+        fd2.append('enhance_audio_quality', String(p2.enhance));
+        fd2.append('type', p2.type);
+        fd2.append('train_mode', p2.trainMode);
+        fd2.append('visibility', p2.visibility);
+        for (const l of p2.languages) fd2.append('languages', l);
+        for (const f of p2.files) {
+          const bin = atob(f.base64);
+          const u8  = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+          fd2.append('voices', new Blob([u8], { type: f.mime }), f.filename);
+          if (f.text) fd2.append('voices_texts', f.text);
+        }
+        const res = await fetch('/model', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + p2.token }, body: fd2,
+        });
+        const body = await res.json().catch(() => ({}));
+        return { ok: res.ok, status: res.status, body };
+      } catch (e) {
+        return { ok: false, status: 0, message: String(e) };
+      }
+    })()`);
+  }
 
   const r = result as { ok: boolean; status: number; body?: Record<string, unknown>; message?: string };
 
@@ -359,6 +431,54 @@ async function apiCreateModel(
       r.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' :
       r.status === 402 ? '账号额度不足，请前往 https://fish.audio/go-api/ 充值' :
       r.status === 422 ? '请检查音频时长（建议 15–300 秒）及格式是否正确' :
+      undefined;
+    fail(msg, hint);
+  }
+  return r.body ?? {};
+}
+
+/**
+ * 删除我的声音模型（克隆/上传）。
+ *
+ * 说明：Fish Audio 的管理接口在 api.fish.audio 上，按同源模式发起 DELETE，
+ * 以避免 CORS 与企业网络下 Node.js 网络栈问题（与 apiTtsPost 同原则）。
+ */
+async function apiDeleteModel(
+  page: IPage,
+  token: string,
+  modelId: string,
+): Promise<Record<string, unknown>> {
+  await ensureOnApiDomain(page);
+
+  const safeId = String(modelId || '').trim();
+  if (!safeId) fail('缺少 model id');
+
+  const result = await page.evaluate(`(async () => {
+    try {
+      if (!location.origin.includes('api.fish.audio')) {
+        return { ok: false, status: 0, message: '导航至 api.fish.audio 失败（当前在 ' + location.origin + '）' };
+      }
+      const id = ${JSON.stringify(safeId)};
+      const res = await fetch('/model/' + encodeURIComponent(id), {
+        method:  'DELETE',
+        headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} },
+      });
+      const body = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, body };
+    } catch (e) {
+      return { ok: false, status: 0, message: String(e) };
+    }
+  })()`);
+
+  const r = result as { ok: boolean; status: number; body?: Record<string, unknown>; message?: string };
+  if (!r.ok) {
+    if (r.message && !r.body) fail(r.message);
+    const body = r.body ?? {};
+    const msg = formatFishApiError(body, r.status);
+    const hint =
+      r.status === 401 ? '登录态已过期，请在 Chrome 中重新登录 fish.audio' :
+      r.status === 403 ? '权限不足（只能删除自己的声音模型）' :
+      r.status === 404 ? '未找到该声音模型（可能已被删除，或 id 不正确）' :
       undefined;
     fail(msg, hint);
   }
@@ -451,6 +571,54 @@ cli({
       name:      result.title ?? kwargs.name,
       state:     result.state ?? 'processing',
       languages: ((result.languages as string[]) || []).join(', ') || (kwargs.language as string) || 'zh',
+    }];
+  },
+});
+
+cli({
+  site: 'fishaudio',
+  name: 'delete',
+  description: '删除我的声音模型（克隆/上传）。危险操作，默认需要 --yes 确认',
+  domain: 'fish.audio',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  navigateBefore: false,
+  args: [
+    {
+      name: 'id',
+      type: 'str',
+      required: true,
+      positional: true,
+      help: '声音模型 ID（可用 opencli fishaudio my-voices 查看）',
+    },
+    {
+      name: 'yes',
+      type: 'bool',
+      default: false,
+      help: '确认删除（必须显式传入 --yes 才会执行）',
+    },
+  ],
+  columns: ['id', 'deleted', 'message'],
+  func: async (page, kwargs) => {
+    if (!page) fail('需要浏览器连接');
+
+    const id = String(kwargs.id || '').trim();
+    if (!id) fail('缺少声音模型 ID');
+
+    if (!(kwargs.yes as boolean)) {
+      fail(
+        '这是危险操作：将永久删除该声音模型',
+        `如果确认删除，请执行：opencli fishaudio delete ${id} --yes`,
+      );
+    }
+
+    const token = await getToken(page);
+    const body = await apiDeleteModel(page, token, id);
+
+    return [{
+      id,
+      deleted: true,
+      message: (body?.message as string) || 'ok',
     }];
   },
 });
@@ -895,8 +1063,8 @@ cli({
       }
     }
 
-    // 导航到登录页，等待 DOM 渲染完成
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', settleMs: 500 });
+    // 导航到登录页（框架 waitUntil 仅支持 load/none；这里用 load 确保表单已渲染）
+    await page.goto(LOGIN_URL, { waitUntil: 'load', settleMs: 500 });
 
     // 等待浏览器自动填充密码（通常在 DOMContentLoaded 后 0.5-1 秒完成）
     await page.wait(1.5);
